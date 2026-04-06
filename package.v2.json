@@ -1,3 +1,4 @@
+{
   "todaybangumi": {
     "name": "Bangumi今日放送",
     "description": "通过 Bangumi 每日放送接口生成海报界面，供用户挑选并添加订阅",
@@ -6,4 +7,5 @@
     "icon": "https://raw.githubusercontent.com/luanyi143/MoviePilot-Plugins/main/icons/Bangumi_A.jpeg",
     "author": "luanyi143",
     "level": 2
-  },
+  }
+}
