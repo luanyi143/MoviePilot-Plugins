@@ -29,7 +29,7 @@ class DoubanComingNotice(_PluginBase):
     # 插件描述
     plugin_desc = "监控豆瓣即将开播电视剧，想看人数达到阈值自动添加订阅，并在开播前指定时间发送提醒。"
     # 插件图标
-    plugin_icon = "douban.png"
+    plugin_icon = "Douban_A.png"
     # 插件版本
     plugin_version = "1.0"
     # 插件作者
