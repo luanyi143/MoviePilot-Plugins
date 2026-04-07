@@ -41,7 +41,7 @@ class DoubanComingNotice(_PluginBase):
     # 加载顺序
     plugin_order = 6
     # 可使用的用户级别
-    auth_level = 2
+    auth_level = 1
 
     # 退出事件
     _event = Event()
