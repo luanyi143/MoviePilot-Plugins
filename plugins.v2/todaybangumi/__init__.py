@@ -22,7 +22,7 @@ from app.utils.http import RequestUtils
 
 class TodayBangumi(_PluginBase):
     plugin_name = "Bangumi每日放送"
-    plugin_desc = "通过 Bangumi 每日放送接口生成海报界面，供用户挑选并添加订阅。"
+    plugin_desc = "通过 Bangumi 每日放送生成海报界面，供用户挑选并添加订阅。"
     plugin_icon = "Bangumi_A.png"
     plugin_version = "1.0"
     plugin_author = "luanyi143"
@@ -75,6 +75,15 @@ class TodayBangumi(_PluginBase):
         )
         self._custom_category = str(config.get("custom_category") or "").strip()
 
+        previous_silent_mode = bool(self.get_data("silent_mode_enabled"))
+        if self._silent_mode and not previous_silent_mode:
+            self.save_data("silent_last_run_date", "")
+            logger.info("[TodayBangumi] 检测到静默模式首次开启，已重置静默执行标记")
+        elif not self._silent_mode and previous_silent_mode:
+            self.save_data("silent_last_run_date", "")
+            logger.info("[TodayBangumi] 检测到静默模式已关闭，已清理静默执行标记")
+        self.save_data("silent_mode_enabled", self._silent_mode)
+
         if self._onlyonce:
             self.__schedule_once()
 
@@ -116,7 +125,7 @@ class TodayBangumi(_PluginBase):
                     "name": "Bangumi每日放送刷新服务",
                     "trigger": CronTrigger.from_crontab(self._cron),
                     "func": self.__refresh_calendar,
-                    "kwargs": {},
+                    "kwargs": {"trigger_source": "cron"},
                 }
             )
 
@@ -621,6 +630,7 @@ class TodayBangumi(_PluginBase):
             trigger="date",
             run_date=self.__now() + datetime.timedelta(seconds=3),
             name="Bangumi每日放送立即刷新",
+            kwargs={"trigger_source": "onlyonce"},
         )
         self._scheduler.start()
         logger.info("[TodayBangumi] 已注册一次性刷新任务")
@@ -643,32 +653,34 @@ class TodayBangumi(_PluginBase):
         )
         self._onlyonce = False
 
-    def __refresh_calendar(self):
+    def __refresh_calendar(self, trigger_source: str = "cron"):
         try:
-            if self.__should_skip_silent_refresh():
-                return
-
             target_date = self.__now().date() + datetime.timedelta(days=self._days_ahead)
             target_weekday = target_date.strftime("%a")
             target_label = self.__build_target_day_label(target_date)
 
-            logger.info(f"[TodayBangumi] 开始刷新 Bangumi 每日放送，目标日期：{target_date}")
+            logger.info(
+                f"[TodayBangumi] 开始刷新 Bangumi 每日放送，目标日期：{target_date}，触发来源：{trigger_source}"
+            )
             items = self.__fetch_bangumi_calendar(target_weekday=target_weekday, target_date=target_date)
             self.save_data("calendar_items", items)
             self.save_data("target_day_label", target_label)
             self.save_data("updated_at", self.__now().strftime("%Y-%m-%d %H:%M:%S"))
 
             if self._silent_mode:
-                silent_completed = False
-                try:
-                    if items:
-                        self.__auto_subscribe_items(items)
-                    silent_completed = True
-                except Exception as err:
-                    logger.error(f"[TodayBangumi] 静默模式自动订阅流程异常：{err}")
+                if self.__should_skip_silent_refresh(trigger_source=trigger_source):
+                    logger.info("[TodayBangumi] 本次将仅刷新每日放送数据，跳过静默自动订阅")
+                else:
+                    silent_completed = False
+                    try:
+                        if items:
+                            self.__auto_subscribe_items(items)
+                        silent_completed = True
+                    except Exception as err:
+                        logger.error(f"[TodayBangumi] 静默模式自动订阅流程异常：{err}")
 
-                if silent_completed:
-                    self.save_data("silent_last_run_date", self.__now().strftime("%Y-%m-%d"))
+                    if silent_completed and trigger_source == "cron":
+                        self.save_data("silent_last_run_date", self.__now().strftime("%Y-%m-%d"))
 
             if self._onlyonce:
                 self.__update_config()
@@ -693,7 +705,6 @@ class TodayBangumi(_PluginBase):
                     subject_id=item.get("subject_id"),
                     bangumi_total_episodes=item.get("bangumi_total_episodes"),
                     use_mp_notify=False,
-                    username="Bangumi每日放送-静默模式",
                 )
                 if success:
                     success_count += 1
@@ -718,14 +729,19 @@ class TodayBangumi(_PluginBase):
             f"[TodayBangumi] 静默模式自动订阅完成：成功 {success_count} 条，失败 {fail_count} 条"
         )
 
-    def __should_skip_silent_refresh(self) -> bool:
-        if not self._silent_mode or self._onlyonce:
+    def __should_skip_silent_refresh(self, trigger_source: str = "cron") -> bool:
+        if not self._silent_mode:
+            return False
+
+        if trigger_source != "cron":
             return False
 
         today_text = self.__now().strftime("%Y-%m-%d")
         last_run_date = str(self.get_data("silent_last_run_date") or "").strip()
         if last_run_date == today_text:
-            logger.info("[TodayBangumi] 静默模式今日已自动执行过，跳过本次定时刷新")
+            logger.info(
+                f"[TodayBangumi] 静默模式今日已完成一次定时自动订阅，跳过本次定时自动订阅：last_run_date={last_run_date}"
+            )
             return True
         return False
 
@@ -1061,7 +1077,6 @@ class TodayBangumi(_PluginBase):
         subject_id: Any = None,
         bangumi_total_episodes: Optional[int] = None,
         use_mp_notify: bool = False,
-        username: str = "Bangumi每日放送",
     ) -> Tuple[bool, str]:
         title = (title or "").strip()
         title_origin = (title_origin or "").strip()
@@ -1103,7 +1118,7 @@ class TodayBangumi(_PluginBase):
             "doubanid": mediainfo.douban_id,
             "season": mediainfo.season or 1,
             "exist_ok": True,
-            "username": username,
+            "username": self.plugin_name,
             "message": use_mp_notify,
         }
 
@@ -1183,7 +1198,6 @@ class TodayBangumi(_PluginBase):
                     subject_id=item.get("subject_id"),
                     bangumi_total_episodes=item.get("bangumi_total_episodes"),
                     use_mp_notify=False,
-                    username="Bangumi每日放送-全部订阅",
                 )
                 if success:
                     success_count += 1
@@ -1230,6 +1244,5 @@ class TodayBangumi(_PluginBase):
             year=year,
             subject_id=subject_id,
             use_mp_notify=True,
-            username="Bangumi每日放送",
         )
         return schemas.Response(success=success, message=message)
