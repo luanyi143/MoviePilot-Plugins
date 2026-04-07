@@ -24,7 +24,7 @@ class TodayBangumi(_PluginBase):
     plugin_name = "Bangumi每日放送"
     plugin_desc = "通过 Bangumi 每日放送生成海报界面，供用户挑选并添加订阅。"
     plugin_icon = "Bangumi_A.png"
-    plugin_version = "1.0"
+    plugin_version = "1.0.1"
     plugin_author = "luanyi143"
     author_url = "https://github.com/luanyi143"
     plugin_config_prefix = "todaybangumi_"
