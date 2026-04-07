@@ -8,4 +8,13 @@
     "author": "luanyi143",
     "level": 2
   }
+    "doubancomingnotice": {
+    "name": "豆瓣将映魔改版",
+    "description": "监控豆瓣即将开播电视剧，想看人数达到阈值自动添加订阅，并在开播前指定时间发送提醒。",
+    "v2": true,
+    "version": "1.0",
+    "icon": "https://raw.githubusercontent.com/luanyi143/MoviePilot-Plugins/main/icons/Douban_A.jpeg",
+    "author": "luanyi143",
+    "level": 2
+  }
 }
