@@ -1,26 +1,26 @@
 import datetime
+import importlib
 import re
 import xml.dom.minidom
 from threading import Event
-from typing import Tuple, List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from app import schemas
-from app.chain.download import DownloadChain
-from app.chain.media import MediaChain
 from app.chain.subscribe import SubscribeChain
 from app.core.config import settings
-from app.core.context import MediaInfo
 from app.core.metainfo import MetaInfo
-from app.helper.mediaserver import MediaServerHelper
 from app.log import logger
 from app.plugins import _PluginBase
-from app.schemas import MediaType
-from app.utils.dom import DomUtils
 from app.utils.http import RequestUtils
+
+try:
+    from app.schemas.types import MediaType
+except Exception:
+    from app.schemas import MediaType
 
 
 class DoubanComingNotice(_PluginBase):
@@ -36,18 +36,17 @@ class DoubanComingNotice(_PluginBase):
     plugin_author = "luanyi143"
     # 作者主页
     author_url = "https://github.com/luanyi143"
-    # 插件配置项ID前缀
+    # 插件配置项 ID 前缀
     plugin_config_prefix = "doubancomingnotice_"
     # 加载顺序
     plugin_order = 6
     # 可使用的用户级别
     auth_level = 2
 
-    # 退出事件
     _event = Event()
     _scheduler: Optional[BackgroundScheduler] = None
+    subscribechain: Optional[SubscribeChain] = None
 
-    # 配置项
     _enabled = False
     _onlyonce = False
     _cron = ""
@@ -60,48 +59,44 @@ class DoubanComingNotice(_PluginBase):
     _notify_hours = 24
     _proxy = False
     _clear = False
-    _clearflag = False
 
     def init_plugin(self, config: dict = None):
-        if config:
-            self._enabled = bool(config.get("enabled"))
-            self._onlyonce = bool(config.get("onlyonce"))
-            self._cron = config.get("cron") or ""
-            self._rsshub = (config.get("rsshub") or "https://rsshub.ddsrem.com").strip() or "https://rsshub.ddsrem.com"
-            self._sort_by = self.__normalize_sort_by(config.get("sort_by"))
-            self._count = self.__safe_positive_int(config.get("count"), 10)
-            self._wish_count_threshold = self.__safe_positive_int(
-                config.get("wish_count_threshold", config.get("hot_threshold")), 5000
-            )
-            self._advance_days = self.__safe_positive_int(config.get("advance_days"), 7)
-            self._notify_before_air = bool(config.get("notify_before_air", True))
-            self._notify_hours = self.__safe_positive_int(config.get("notify_hours"), 24)
-            self._proxy = bool(config.get("proxy"))
-            self._clear = bool(config.get("clear"))
-
-        # 停止现有任务
         self.stop_service()
 
-        # 启动服务
-        if self._enabled or self._onlyonce:
-            if self._onlyonce:
-                self._scheduler = BackgroundScheduler(timezone=settings.TZ)
-                logger.info("豆瓣即将开播订阅服务启动，立即运行一次")
-                self._scheduler.add_job(
-                    func=self.__refresh_rss,
-                    trigger="date",
-                    run_date=datetime.datetime.now(tz=pytz.timezone(settings.TZ))
-                    + datetime.timedelta(seconds=3),
-                )
-                if self._scheduler.get_jobs():
-                    self._scheduler.print_jobs()
-                    self._scheduler.start()
+        config = config or {}
+        self._enabled = bool(config.get("enabled", False))
+        self._onlyonce = bool(config.get("onlyonce", False))
+        self._cron = str(config.get("cron") or "").strip()
+        self._rsshub = (config.get("rsshub") or "https://rsshub.ddsrem.com").strip() or "https://rsshub.ddsrem.com"
+        self._sort_by = self.__normalize_sort_by(config.get("sort_by"))
+        self._count = self.__safe_positive_int(config.get("count"), 10)
+        self._wish_count_threshold = self.__safe_positive_int(
+            config.get("wish_count_threshold", config.get("hot_threshold")),
+            5000,
+        )
+        self._advance_days = self.__safe_positive_int(config.get("advance_days", config.get("advance", "7day")), 7)
+        self._notify_before_air = bool(config.get("notify_before_air", True))
+        self._notify_hours = self.__safe_positive_int(config.get("notify_hours"), 24)
+        self._proxy = bool(config.get("proxy", False))
+        self._clear = bool(config.get("clear", False))
 
-            if self._onlyonce or self._clear:
-                self._onlyonce = False
-                self._clearflag = self._clear
-                self._clear = False
-                self.__update_config()
+        try:
+            self.subscribechain = SubscribeChain()
+        except Exception as err:
+            self.subscribechain = None
+            logger.warning(f"豆瓣即将开播订阅：初始化订阅链失败，不影响插件加载，错误：{err}")
+
+        if self._clear:
+            self.save_data("history", [])
+            self.save_data("notify_history", [])
+            self._clear = False
+            logger.info("豆瓣即将开播订阅：历史记录已清理")
+            self.__update_config()
+
+        if self._onlyonce:
+            self.__schedule_once()
+            self._onlyonce = False
+            self.__update_config()
 
     def get_state(self) -> bool:
         return self._enabled
@@ -121,27 +116,25 @@ class DoubanComingNotice(_PluginBase):
         ]
 
     def get_service(self) -> List[Dict[str, Any]]:
-        if self._enabled and self._cron:
-            return [
-                {
-                    "id": "DoubanComingNotice",
-                    "name": "豆瓣即将开播订阅服务",
-                    "trigger": CronTrigger.from_crontab(self._cron),
-                    "func": self.__refresh_rss,
-                    "kwargs": {},
-                }
-            ]
-        elif self._enabled:
-            return [
-                {
-                    "id": "DoubanComingNotice",
-                    "name": "豆瓣即将开播订阅服务",
-                    "trigger": CronTrigger.from_crontab("0 8 * * *"),
-                    "func": self.__refresh_rss,
-                    "kwargs": {},
-                }
-            ]
-        return []
+        if not self._enabled:
+            return []
+
+        cron_text = self._cron or "0 8 * * *"
+        try:
+            trigger = CronTrigger.from_crontab(cron_text)
+        except Exception:
+            logger.warning(f"豆瓣即将开播订阅：Cron 表达式无效 {cron_text}，已回退到默认值 0 8 * * *")
+            trigger = CronTrigger.from_crontab("0 8 * * *")
+
+        return [
+            {
+                "id": "DoubanComingNotice",
+                "name": "豆瓣即将开播订阅服务",
+                "trigger": trigger,
+                "func": self.__refresh_rss,
+                "kwargs": {},
+            }
+        ]
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         return [
@@ -244,7 +237,7 @@ class DoubanComingNotice(_PluginBase):
                                 "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
-                                        "component": "VCronField",
+                                        "component": "VTextField",
                                         "props": {
                                             "model": "cron",
                                             "label": "执行周期",
@@ -295,7 +288,7 @@ class DoubanComingNotice(_PluginBase):
                                         "props": {
                                             "model": "advance_days",
                                             "label": "提前订阅天数",
-                                            "placeholder": "距离开播小于等于该值才订阅，默认7",
+                                            "placeholder": "支持 7 或 7day，默认7",
                                         },
                                     }
                                 ],
@@ -346,7 +339,7 @@ class DoubanComingNotice(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": "仅处理想看人数达到阈值的电视剧；支持提前订阅，并在开播前指定时间发送一次提醒。本插件基于honue大佬的思路魔改。",
+                                            "text": "插件通过 RSSHub 的 /douban/tv/coming/:sortBy?/:count? 路由获取豆瓣将映电视剧数据。达到热度阈值且距离开播时间不超过设定天数时自动添加订阅；进入提醒窗口后只发送一次开播提醒。",
                                         },
                                     }
                                 ],
@@ -371,320 +364,88 @@ class DoubanComingNotice(_PluginBase):
         }
 
     def get_page(self) -> List[dict]:
-        historys = self.get_data("history")
+        historys = self.get_data("history") or []
         if not historys:
             return [
                 {
-                    "component": "div",
-                    "text": "暂无数据",
+                    "component": "VAlert",
                     "props": {
-                        "class": "text-center text-medium-emphasis py-8",
+                        "type": "info",
+                        "variant": "tonal",
+                        "text": "暂无历史数据，请先启用插件并执行一次刷新。",
                     },
                 }
             ]
 
-        historys = sorted(historys, key=lambda x: x.get("time"), reverse=True)
-        contents = []
-
-        for history in historys:
-            title = history.get("title") or "-"
-            poster = history.get("poster")
-            mtype = history.get("type") or "电视剧"
-            time_str = history.get("time") or "-"
-            doubanid = history.get("doubanid")
-            wish_count = history.get("wish_count") or history.get("hot") or "-"
-            air_date = history.get("air_date") or "-"
-            notified = bool(history.get("air_notify_sent"))
-            subscribed = bool(history.get("subscribed"))
-            genres_list = [genre for genre in (history.get("genres") or []) if genre]
-            genres = " / ".join(genres_list) or "-"
-            douban_url = f"https://movie.douban.com/subject/{doubanid}" if doubanid else None
-
-            genre_text = " / ".join(genres_list[:3]) if genres_list else genres
-            if len(genres_list) > 3:
-                genre_text = f"{genre_text} / +{len(genres_list) - 3}"
-
-            status_text = f"{'已订阅' if subscribed else '未订阅'} / {'已提醒' if notified else '未提醒'}"
-
-            title_content = [
-                {
-                    "component": "span",
-                    "props": {
-                        "class": "text-body-2 font-weight-bold text-high-emphasis line-clamp-2",
-                    },
-                    "text": title,
-                }
-            ]
-            if douban_url:
-                title_content = [
-                    {
-                        "component": "a",
-                        "props": {
-                            "href": douban_url,
-                            "target": "_blank",
-                            "class": "text-body-2 font-weight-bold text-high-emphasis text-decoration-none line-clamp-2",
-                        },
-                        "text": title,
-                    }
-                ]
-
-            contents.append(
-                {
-                    "component": "VCard",
-                    "props": {
-                        "class": "pa-2 rounded-lg position-relative overflow-hidden h-100",
-                        "variant": "elevated",
-                        "elevation": 2,
-                        "style": "height: 250px;",
-                    },
-                    "content": [
-                        {
-                            "component": "VDialogCloseBtn",
-                            "props": {
-                                "innerClass": "absolute top-0 right-0 mt-1 me-1 opacity-60",
-                            },
-                            "events": {
-                                "click": {
-                                    "api": "plugin/DoubanComingNotice/delete_history",
-                                    "method": "get",
-                                    "params": {
-                                        "key": history.get("unique"),
-                                        "apikey": settings.API_TOKEN,
-                                    },
-                                }
-                            },
-                        },
-                        {
-                            "component": "div",
-                            "props": {
-                                "class": "d-flex align-start ga-2 h-100",
-                            },
-                            "content": [
-                                {
-                                    "component": "div",
-                                    "props": {
-                                        "class": "d-flex flex-column align-start justify-start flex-shrink-0",
-                                        "style": "width: 96px;",
-                                    },
-                                    "content": [
-                                        {
-                                            "component": "VImg",
-                                            "props": {
-                                                "src": poster,
-                                                "height": 144,
-                                                "width": 96,
-                                                "aspect-ratio": "2/3",
-                                                "class": "rounded-lg shadow object-cover bg-grey-lighten-3",
-                                                "cover": True,
-                                            },
-                                        }
-                                    ],
-                                },
-                                {
-                                    "component": "div",
-                                    "props": {
-                                        "class": "d-flex flex-column flex-grow-1 min-w-0 h-100 ps-1 pt-1 pe-1",
-                                    },
-                                    "content": [
-                                        {
-                                            "component": "div",
-                                            "props": {
-                                                "class": "mb-1 lh-sm",
-                                            },
-                                            "content": title_content,
-                                        },
-                                        {
-                                            "component": "div",
-                                            "props": {
-                                                "class": "d-grid ga-1 text-caption",
-                                            },
-                                            "content": [
-                                                {
-                                                    "component": "div",
-                                                    "props": {
-                                                        "class": "d-flex align-start",
-                                                    },
-                                                    "content": [
-                                                        {
-                                                            "component": "span",
-                                                            "props": {
-                                                                "class": "text-caption text-high-emphasis font-weight-medium me-1 flex-shrink-0",
-                                                                "style": "width: 36px;",
-                                                            },
-                                                            "text": "类型",
-                                                        },
-                                                        {
-                                                            "component": "div",
-                                                            "props": {
-                                                                "class": "text-caption text-medium-emphasis flex-grow-1 min-w-0",
-                                                                "style": "line-height: 1.35;",
-                                                            },
-                                                            "text": mtype,
-                                                        },
-                                                    ],
-                                                },
-                                                {
-                                                    "component": "div",
-                                                    "props": {
-                                                        "class": "d-flex align-start",
-                                                    },
-                                                    "content": [
-                                                        {
-                                                            "component": "span",
-                                                            "props": {
-                                                                "class": "text-caption text-high-emphasis font-weight-medium me-1 flex-shrink-0",
-                                                                "style": "width: 36px;",
-                                                            },
-                                                            "text": "分类",
-                                                        },
-                                                        {
-                                                            "component": "div",
-                                                            "props": {
-                                                                "class": "text-caption text-medium-emphasis flex-grow-1 min-w-0",
-                                                                "style": "line-height: 1.35;",
-                                                            },
-                                                            "text": genre_text,
-                                                        },
-                                                    ],
-                                                },
-                                                {
-                                                    "component": "div",
-                                                    "props": {
-                                                        "class": "d-flex align-start",
-                                                    },
-                                                    "content": [
-                                                        {
-                                                            "component": "span",
-                                                            "props": {
-                                                                "class": "text-caption text-high-emphasis font-weight-medium me-1 flex-shrink-0",
-                                                                "style": "width: 36px;",
-                                                            },
-                                                            "text": "想看",
-                                                        },
-                                                        {
-                                                            "component": "div",
-                                                            "props": {
-                                                                "class": "text-caption text-medium-emphasis flex-grow-1 min-w-0",
-                                                            },
-                                                            "text": str(wish_count),
-                                                        },
-                                                    ],
-                                                },
-                                                {
-                                                    "component": "div",
-                                                    "props": {
-                                                        "class": "d-flex align-start",
-                                                    },
-                                                    "content": [
-                                                        {
-                                                            "component": "span",
-                                                            "props": {
-                                                                "class": "text-caption text-high-emphasis font-weight-medium me-1 flex-shrink-0",
-                                                                "style": "width: 36px;",
-                                                            },
-                                                            "text": "开播",
-                                                        },
-                                                        {
-                                                            "component": "div",
-                                                            "props": {
-                                                                "class": "text-caption text-medium-emphasis flex-grow-1 min-w-0",
-                                                            },
-                                                            "text": air_date,
-                                                        },
-                                                    ],
-                                                },
-                                                {
-                                                    "component": "div",
-                                                    "props": {
-                                                        "class": "d-flex align-start",
-                                                    },
-                                                    "content": [
-                                                        {
-                                                            "component": "span",
-                                                            "props": {
-                                                                "class": "text-caption text-high-emphasis font-weight-medium me-1 flex-shrink-0",
-                                                                "style": "width: 36px;",
-                                                            },
-                                                            "text": "处理",
-                                                        },
-                                                        {
-                                                            "component": "div",
-                                                            "props": {
-                                                                "class": "text-caption text-medium-emphasis flex-grow-1 min-w-0",
-                                                                "style": "line-height: 1.35;",
-                                                            },
-                                                            "text": time_str,
-                                                        },
-                                                    ],
-                                                },
-                                                {
-                                                    "component": "div",
-                                                    "props": {
-                                                        "class": "d-flex align-start",
-                                                    },
-                                                    "content": [
-                                                        {
-                                                            "component": "span",
-                                                            "props": {
-                                                                "class": "text-caption text-high-emphasis font-weight-medium me-1 flex-shrink-0",
-                                                                "style": "width: 36px;",
-                                                            },
-                                                            "text": "状态",
-                                                        },
-                                                        {
-                                                            "component": "div",
-                                                            "props": {
-                                                                "class": "text-caption text-medium-emphasis flex-grow-1 min-w-0",
-                                                                "style": "line-height: 1.35;",
-                                                            },
-                                                            "text": status_text,
-                                                        },
-                                                    ],
-                                                },
-                                            ],
-                                        },
-                                    ],
-                                },
-                            ],
-                        },
-                    ],
-                }
-            )
+        historys = sorted(historys, key=lambda x: x.get("time") or "", reverse=True)
+        updated_at = historys[0].get("time") or "-"
 
         return [
             {
                 "component": "div",
-                "props": {
-                    "class": "grid gap-2 grid-info-card",
-                    "style": "grid-template-columns: repeat(4, minmax(0, 1fr));",
-                },
-                "content": contents,
-            }
+                "props": {"class": "mb-3"},
+                "content": [
+                    {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "success",
+                            "variant": "tonal",
+                            "text": f"当前共有 {len(historys)} 条历史记录，最近处理时间：{updated_at}",
+                        },
+                    }
+                ],
+            },
+            {
+                "component": "div",
+                "props": {"class": "grid gap-3 grid-info-card"},
+                "content": [self.__build_history_card(history) for history in historys],
+            },
         ]
 
     def stop_service(self):
         try:
+            self._event.set()
             if self._scheduler:
-                self._scheduler.remove_all_jobs()
-                if self._scheduler.running:
-                    self._event.set()
+                try:
+                    self._scheduler.remove_all_jobs()
+                except Exception:
+                    pass
+                try:
+                    self._scheduler.shutdown(wait=False)
+                except TypeError:
                     self._scheduler.shutdown()
-                    self._event.clear()
+                except Exception:
+                    pass
                 self._scheduler = None
+            self._event.clear()
         except Exception as err:
             logger.error(f"停止豆瓣即将开播订阅服务失败：{err}")
 
-    def delete_history(self, key: str, apikey: str):
+    def delete_history(self, key: str = "", apikey: str = ""):
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False, message="API密钥错误")
 
-        historys = self.get_data("history")
+        historys = self.get_data("history") or []
         if not historys:
             return schemas.Response(success=False, message="未找到历史记录")
 
-        historys = [h for h in historys if h.get("unique") != key]
+        historys = [item for item in historys if item.get("unique") != key]
         self.save_data("history", historys)
         return schemas.Response(success=True, message="删除成功")
+
+    def __schedule_once(self):
+        try:
+            self._scheduler = BackgroundScheduler(timezone=self.__get_timezone())
+            self._scheduler.add_job(
+                func=self.__refresh_rss,
+                trigger="date",
+                run_date=self.__now() + datetime.timedelta(seconds=3),
+                name="豆瓣即将开播订阅立即执行",
+            )
+            self._scheduler.start()
+            logger.info("豆瓣即将开播订阅：已注册一次性执行任务")
+        except Exception as err:
+            logger.error(f"豆瓣即将开播订阅：注册一次性执行任务失败：{err}")
 
     def __update_config(self):
         self.update_config(
@@ -693,22 +454,21 @@ class DoubanComingNotice(_PluginBase):
                 "notify_before_air": self._notify_before_air,
                 "notify_hours": self._notify_hours,
                 "proxy": self._proxy,
-                "onlyonce": self._onlyonce,
+                "onlyonce": False,
                 "cron": self._cron,
                 "rsshub": self._rsshub,
                 "sort_by": self._sort_by,
                 "count": self._count,
                 "wish_count_threshold": self._wish_count_threshold,
                 "advance_days": self._advance_days,
-                "clear": self._clear,
+                "clear": False,
             }
         )
 
     @staticmethod
     def __normalize_sort_by(value: Any) -> str:
-        if str(value).lower() in {"hot", "time"}:
-            return str(value).lower()
-        return "hot"
+        text = str(value or "").strip().lower()
+        return text if text in {"hot", "time"} else "hot"
 
     @staticmethod
     def __safe_positive_int(value: Any, default: int) -> int:
@@ -718,18 +478,98 @@ class DoubanComingNotice(_PluginBase):
                 return ivalue
         except Exception:
             pass
+
+        text = str(value or "").strip().lower()
+        match = re.search(r"(\d+)", text)
+        if match:
+            try:
+                ivalue = int(match.group(1))
+                if ivalue > 0:
+                    return ivalue
+            except Exception:
+                pass
         return default
 
+    @staticmethod
+    def __normalize_url(url: Any) -> str:
+        raw_url = str(url or "").strip()
+        if not raw_url:
+            return ""
+        if raw_url.startswith("//"):
+            return f"https:{raw_url}"
+        if raw_url.startswith("http://") or raw_url.startswith("https://"):
+            return raw_url
+        return ""
+
     def __build_rss_url(self) -> str:
-        base = (self._rsshub or "https://rsshub.ddsrem.com").rstrip("/")
+        base = (self._rsshub or "https://rsshub.ddsrem.com").strip().rstrip("/")
         return f"{base}/douban/tv/coming/{self._sort_by}/{self._count}"
 
     @staticmethod
-    def __extract_wish_count(text: str) -> int:
-        if not text:
+    def __get_timezone():
+        tz_name = getattr(settings, "TZ", "Asia/Shanghai") or "Asia/Shanghai"
+        try:
+            return pytz.timezone(tz_name)
+        except Exception:
+            return pytz.timezone("Asia/Shanghai")
+
+    def __now(self) -> datetime.datetime:
+        return datetime.datetime.now(self.__get_timezone())
+
+    @staticmethod
+    def __tag_value(node, tag_name: str, default: str = "") -> str:
+        try:
+            elements = node.getElementsByTagName(tag_name)
+            if not elements:
+                return default
+            target = elements[0]
+            values = []
+            for child in target.childNodes:
+                if getattr(child, "nodeValue", None):
+                    values.append(child.nodeValue)
+            return "".join(values).strip() if values else default
+        except Exception:
+            return default
+
+    @staticmethod
+    def __strip_html(text: Any) -> str:
+        raw = str(text or "")
+        if not raw:
+            return ""
+        raw = re.sub(r"<br\s*/?>", "\n", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"</p\s*>", "\n", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"<[^>]+>", " ", raw)
+        raw = raw.replace("&nbsp;", " ").replace("&#160;", " ").replace("&", "&")
+        raw = re.sub(r"\s+", " ", raw).strip()
+        return raw
+
+    def __extract_poster(self, text: Any) -> str:
+        raw = str(text or "")
+        if not raw:
+            return ""
+
+        patterns = [
+            r"""<img[^>]+src=["']([^"']+)["']""",
+            r"""url=["']([^"']+)["']""",
+            r"""(https?://[^\s"'<>]+?\.(?:jpg|jpeg|png|webp|gif))""",
+            r"""(//[^\s"'<>]+?\.(?:jpg|jpeg|png|webp|gif))""",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, raw, re.IGNORECASE)
+            if not match:
+                continue
+            poster = self.__normalize_url(match.group(1))
+            if poster:
+                return poster
+        return ""
+
+    @staticmethod
+    def __extract_wish_count(text: Any) -> int:
+        raw = str(text or "")
+        if not raw:
             return 0
 
-        clean_text = text.replace(",", "").replace("，", "")
+        clean_text = raw.replace(",", "").replace("，", "")
         patterns = [
             r"(?:想看人数|想看)\s*[:：]?\s*(\d+)",
             r"(\d+)\s*人想看",
@@ -744,35 +584,51 @@ class DoubanComingNotice(_PluginBase):
         return 0
 
     @staticmethod
-    def __extract_air_date(text: str) -> Optional[datetime.date]:
-        if not text:
+    def __extract_year(text: Any) -> Optional[str]:
+        raw = str(text or "")
+        if not raw:
             return None
-
-        patterns = [
-            r"(20\d{2})[-/年.](\d{1,2})[-/月.](\d{1,2})",
-            r"(19\d{2})[-/年.](\d{1,2})[-/月.](\d{1,2})",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text)
-            if not match:
-                continue
-            try:
-                year = int(match.group(1))
-                month = int(match.group(2))
-                day = int(match.group(3))
-                return datetime.date(year, month, day)
-            except Exception:
-                continue
-        return None
-
-    @staticmethod
-    def __extract_year(text: str) -> Optional[str]:
-        if not text:
-            return None
-        match = re.search(r"\b(19\d{2}|20\d{2})\b", text)
+        match = re.search(r"\b(19\d{2}|20\d{2})\b", raw)
         if match:
             return match.group(1)
         return None
+
+    @staticmethod
+    def __parse_date_value(text: Any) -> Optional[str]:
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+
+        match = re.search(r"(19\d{2}|20\d{2})[-/年.](\d{1,2})[-/月.](\d{1,2})", raw)
+        if not match:
+            return None
+
+        try:
+            year = int(match.group(1))
+            month = int(match.group(2))
+            day = int(match.group(3))
+            return datetime.date(year, month, day).strftime("%Y-%m-%d")
+        except Exception:
+            return None
+
+    def __extract_air_date(self, text: Any) -> Optional[str]:
+        raw = str(text or "")
+        if not raw:
+            return None
+
+        clean_text = self.__strip_html(raw)
+        keyword_patterns = [
+            r"(?:首播|播出|开播|上映|上線|首映|播映|放送|开播日期|首播日期|首播时间|上映日期)\s*[:：]?\s*((?:19|20)\d{2}[-/年.]\d{1,2}[-/月.]\d{1,2})",
+        ]
+        for pattern in keyword_patterns:
+            match = re.search(pattern, clean_text, re.IGNORECASE)
+            if not match:
+                continue
+            date_value = self.__parse_date_value(match.group(1))
+            if date_value:
+                return date_value
+
+        return self.__parse_date_value(clean_text)
 
     @staticmethod
     def __chinese_to_int(text: str) -> Optional[int]:
@@ -780,6 +636,7 @@ class DoubanComingNotice(_PluginBase):
             return None
 
         mapping = {
+            "零": 0,
             "一": 1,
             "二": 2,
             "三": 3,
@@ -797,7 +654,8 @@ class DoubanComingNotice(_PluginBase):
             return value if value > 0 else None
 
         if text in mapping:
-            return mapping[text]
+            value = mapping.get(text)
+            return value if value and value > 0 else None
 
         if text.startswith("十"):
             tail = text[1:]
@@ -818,11 +676,10 @@ class DoubanComingNotice(_PluginBase):
 
         patterns = [
             r"[第\s]*([0-9]{1,2})\s*季",
-            r"第([一二三四五六七八九十]{1,3})季",
+            r"第([零一二三四五六七八九十]{1,3})季",
             r"\bS\s*([0-9]{1,2})\b",
             r"\bSeason\s*([0-9]{1,2})\b",
         ]
-
         for pattern in patterns:
             match = re.search(pattern, title, re.IGNORECASE)
             if not match:
@@ -830,139 +687,162 @@ class DoubanComingNotice(_PluginBase):
             value = self.__chinese_to_int(match.group(1))
             if value and value > 0:
                 return value
-
         return None
 
-    def __fetch_tmdb_air_date(
-        self,
-        mediainfo: MediaInfo,
-        current_season: Optional[int] = None,
-    ) -> Optional[str]:
-        if not mediainfo or not mediainfo.tmdb_id or not mediainfo.type:
-            return None
+    def __build_title_candidates(self, title: str) -> List[str]:
+        candidates = []
+        raw_title = str(title or "").strip()
+        if raw_title:
+            candidates.append(raw_title)
 
-        if mediainfo.type == MediaType.TV and current_season and current_season > 0:
+        stripped_title = re.sub(
+            r"\s*(第[零一二三四五六七八九十\d]{1,3}季|Season\s*\d{1,2}|S\s*\d{1,2})\s*$",
+            "",
+            raw_title,
+            flags=re.IGNORECASE,
+        ).strip()
+        if stripped_title and stripped_title not in candidates:
+            candidates.append(stripped_title)
+
+        return candidates
+
+    def __build_meta(self, title: str, year: Optional[str] = None, season: Optional[int] = None) -> MetaInfo:
+        meta = MetaInfo(title)
+        if year:
             try:
-                season_info = self.chain.tmdb_info(
-                    tmdbid=mediainfo.tmdb_id,
-                    mtype=mediainfo.type,
-                    season=current_season,
+                meta.year = str(year)
+            except Exception:
+                pass
+        try:
+            meta.type = MediaType.TV
+        except Exception:
+            pass
+        if season:
+            try:
+                meta.begin_season = season
+            except Exception:
+                pass
+        return meta
+
+    def __recognize_media_compat(self, title: str, year: Optional[str] = None, douban_id: Optional[str] = None):
+        recognize = getattr(self.chain, "recognize_media", None)
+        if not callable(recognize):
+            logger.warning("豆瓣即将开播订阅：当前版本未提供 recognize_media 接口")
+            return None, None
+
+        season = self.__extract_season_from_title(title)
+
+        for candidate_title in self.__build_title_candidates(title):
+            meta = self.__build_meta(candidate_title, year=year, season=season)
+            attempts = []
+
+            if douban_id:
+                attempts.extend(
+                    [
+                        {"meta": meta, "doubanid": douban_id, "mtype": MediaType.TV},
+                        {"meta": meta, "doubanid": douban_id},
+                    ]
                 )
-                season_air_date = season_info.get("air_date") if season_info else None
-                parsed_season_air_date = self.__extract_air_date(str(season_air_date)) if season_air_date else None
-                if parsed_season_air_date:
-                    result = parsed_season_air_date.strftime("%Y-%m-%d")
-                    logger.info(f"TMDB 当前季开播日期解析成功：tmdb={mediainfo.tmdb_id} S{current_season} -> {result}")
-                    return result
-            except Exception as err:
-                logger.warning(f"获取 TMDB 当前季开播日期失败：tmdb={mediainfo.tmdb_id} S{current_season}，错误：{err}")
 
-        try:
-            tmdb_info = self.chain.tmdb_info(
-                tmdbid=mediainfo.tmdb_id,
-                mtype=mediainfo.type,
+            attempts.extend(
+                [
+                    {"meta": meta, "mtype": MediaType.TV},
+                    {"meta": meta},
+                ]
             )
-            air_date = None
-            if tmdb_info:
-                air_date = tmdb_info.get("first_air_date") or tmdb_info.get("air_date") or tmdb_info.get("release_date")
-            parsed_air_date = self.__extract_air_date(str(air_date)) if air_date else None
-            if parsed_air_date:
-                result = parsed_air_date.strftime("%Y-%m-%d")
-                logger.info(f"TMDB 剧级开播日期解析成功：tmdb={mediainfo.tmdb_id} -> {result}")
-                return result
-        except Exception as err:
-            logger.warning(f"获取 TMDB 剧级开播日期失败：tmdb={mediainfo.tmdb_id}，错误：{err}")
 
-        return None
-
-    def __get_rss_info(self, addr: str) -> List[dict]:
-        try:
-            if self._proxy:
-                ret = RequestUtils(proxies=settings.PROXY).get_res(addr)
-            else:
-                ret = RequestUtils().get_res(addr)
-
-            if not ret:
-                return []
-
-            ret_xml = ret.text
-            ret_array: List[dict] = []
-
-            dom_tree = xml.dom.minidom.parseString(ret_xml)
-            root_node = dom_tree.documentElement
-            items = root_node.getElementsByTagName("item")
-
-            for item in items:
+            for kwargs in attempts:
                 try:
-                    rss_info: Dict[str, Any] = {}
-
-                    title = DomUtils.tag_value(item, "title", default="")
-                    link = DomUtils.tag_value(item, "link", default="")
-                    description = DomUtils.tag_value(item, "description", default="")
-
-                    if not title and not link:
-                        logger.warning("条目标题和链接均为空，无法处理")
-                        continue
-
-                    rss_info["title"] = title.strip()
-                    rss_info["link"] = link.strip()
-                    rss_info["description"] = description or ""
-
-                    doubanid = re.findall(r"/(\d+)(?=/|$)", link)
-                    if doubanid:
-                        doubanid = doubanid[0]
-                    else:
-                        doubanid = None
-
-                    if doubanid and not str(doubanid).isdigit():
-                        logger.warning(f"解析的豆瓣ID格式不正确：{doubanid}")
-                        continue
-
-                    rss_info["doubanid"] = doubanid
-                    rss_info["wish_count"] = self.__extract_wish_count(description)
-                    rss_info["year"] = self.__extract_year(description)
-
-                    ret_array.append(rss_info)
-                except Exception as item_err:
-                    logger.error(f"解析RSS条目失败：{item_err}")
+                    mediainfo = recognize(**kwargs)
+                    if mediainfo:
+                        return mediainfo, meta
+                except TypeError:
+                    continue
+                except Exception as err:
+                    logger.warning(f"豆瓣即将开播订阅：媒体识别失败，title={candidate_title}，错误：{err}")
                     continue
 
-            return ret_array
-        except Exception as err:
-            logger.error(f"获取RSS失败：{err}")
-            return []
+        return None, None
 
     @staticmethod
-    def __days_until_air(air_date_str: Optional[str]) -> Optional[int]:
-        if not air_date_str:
-            return None
-        try:
-            air_date = datetime.datetime.strptime(air_date_str, "%Y-%m-%d").date()
-            today = datetime.datetime.now().date()
-            return (air_date - today).days
-        except Exception:
-            return None
+    def __get_media_type_value(mediainfo: Any) -> str:
+        media_type = getattr(mediainfo, "type", None)
+        if media_type is None:
+            return ""
+        if hasattr(media_type, "value"):
+            return str(media_type.value)
+        return str(media_type)
 
-    def __hours_until_air(self, air_date_str: Optional[str]) -> Optional[float]:
-        if not air_date_str:
-            return None
-        try:
-            tz = pytz.timezone(settings.TZ)
-            air_date = datetime.datetime.strptime(air_date_str, "%Y-%m-%d").date()
-            air_datetime = tz.localize(datetime.datetime.combine(air_date, datetime.time.min))
-            now = datetime.datetime.now(tz)
-            return (air_datetime - now).total_seconds() / 3600
-        except Exception:
-            return None
+    def __is_tv_media(self, mediainfo: Any) -> bool:
+        media_type = self.__get_media_type_value(mediainfo).strip().lower()
+        if not media_type:
+            return True
+        return media_type in {"tv", "电视剧", "剧集", "series"}
 
     @staticmethod
-    def __get_media_genres(mediainfo: MediaInfo) -> List[str]:
+    def __get_media_attr(mediainfo: Any, names: List[str], default: Any = None) -> Any:
+        for name in names:
+            value = getattr(mediainfo, name, None)
+            if value not in [None, ""]:
+                return value
+        return default
+
+    def __get_media_title(self, mediainfo: Any) -> str:
+        return str(self.__get_media_attr(mediainfo, ["title", "name"], "") or "")
+
+    def __get_media_title_year(self, mediainfo: Any) -> str:
+        title_year = self.__get_media_attr(mediainfo, ["title_year"], None)
+        if title_year:
+            return str(title_year)
+        title = self.__get_media_title(mediainfo)
+        year = self.__get_media_year(mediainfo)
+        return f"{title} {year}".strip()
+
+    def __get_media_year(self, mediainfo: Any) -> str:
+        return str(self.__get_media_attr(mediainfo, ["year"], "") or "")
+
+    def __get_media_tmdbid(self, mediainfo: Any) -> Any:
+        return self.__get_media_attr(mediainfo, ["tmdb_id", "tmdbid"], None)
+
+    def __get_media_doubanid(self, mediainfo: Any) -> Any:
+        return self.__get_media_attr(mediainfo, ["douban_id", "doubanid"], None)
+
+    def __get_media_season(self, mediainfo: Any) -> int:
+        value = self.__get_media_attr(mediainfo, ["season", "begin_season"], 1)
+        try:
+            value = int(value)
+            return value if value > 0 else 1
+        except Exception:
+            return 1
+
+    def __get_media_overview(self, mediainfo: Any) -> str:
+        return str(self.__get_media_attr(mediainfo, ["overview", "summary", "description"], "") or "")
+
+    def __get_media_poster(self, mediainfo: Any) -> str:
+        get_poster_image = getattr(mediainfo, "get_poster_image", None)
+        if callable(get_poster_image):
+            try:
+                poster = get_poster_image()
+                if poster:
+                    return str(poster)
+            except Exception:
+                pass
+
+        poster = self.__get_media_attr(
+            mediainfo,
+            ["poster", "poster_url", "image", "image_url", "thumb", "cover"],
+            "",
+        )
+        return self.__normalize_url(poster)
+
+    def __get_media_genres(self, mediainfo: Any) -> List[str]:
         genre_values: List[str] = []
 
         for attr in ["genres", "genre", "category", "categories"]:
             value = getattr(mediainfo, attr, None)
             if not value:
                 continue
+
             if isinstance(value, list):
                 for item in value:
                     if isinstance(item, dict):
@@ -974,247 +854,239 @@ class DoubanComingNotice(_PluginBase):
             elif isinstance(value, str):
                 genre_values.extend([part.strip() for part in re.split(r"[/,，|]+", value) if part.strip()])
 
-        deduped = []
+        deduped: List[str] = []
         for item in genre_values:
             if item and item not in deduped:
                 deduped.append(item)
+
         return deduped
 
+    def __extract_air_date_from_mediainfo(self, mediainfo: Any) -> Optional[str]:
+        for attr in ["air_date", "first_air_date", "release_date", "premiere_date", "date"]:
+            value = getattr(mediainfo, attr, None)
+            date_value = self.__parse_date_value(value)
+            if date_value:
+                return date_value
+
+        details = getattr(mediainfo, "detail", None) or getattr(mediainfo, "details", None)
+        if isinstance(details, dict):
+            for key in ["air_date", "first_air_date", "release_date", "premiere_date", "date"]:
+                date_value = self.__parse_date_value(details.get(key))
+                if date_value:
+                    return date_value
+
+        return None
+
     @staticmethod
-    def __get_current_season(meta: MetaInfo, mediainfo: MediaInfo, title_season: Optional[int] = None) -> int:
-        for value in [title_season, getattr(meta, "begin_season", None), getattr(mediainfo, "season", None)]:
-            try:
-                season = int(value)
-                if season > 0:
-                    return season
-            except Exception:
-                continue
-        return 1
+    def __result_to_bool(result: Any) -> bool:
+        if result is None:
+            return False
+        if isinstance(result, (list, tuple)):
+            if not result:
+                return False
+            return bool(result[0])
+        return bool(result)
 
-    def __get_active_media_service(self, server: str = None, server_type: str = None):
-        services = MediaServerHelper().get_services(type_filter=server_type, name_filters=[server] if server else None)
-        if not services:
-            return None
-        if server:
-            return services.get(server)
-        return next(iter(services.values()), None)
-
-    def __get_media_server_iteminfo(self, server: str, server_type: str, itemid: str) -> dict:
-        service = self.__get_active_media_service(server=server, server_type=server_type)
-        if not service:
-            logger.warning(f"未找到媒体服务器实例：server={server} type={server_type}")
-            return {}
+    def __get_subscribe_chain(self) -> Optional[SubscribeChain]:
+        if self.subscribechain:
+            return self.subscribechain
 
         try:
-            if server_type == "emby":
-                url = f"[HOST]emby/Users/[USER]/Items/{itemid}?Fields=ProviderIds,Path,RecursiveItemCount,ChildCount&api_key=[APIKEY]"
-                res = service.instance.get_data(url=url)
-                return res.json() if res else {}
-            if server_type == "jellyfin":
-                url = f"[HOST]Users/[USER]/Items/{itemid}?Fields=ProviderIds,Path,RecursiveItemCount,ChildCount&api_key=[APIKEY]"
-                res = service.instance.get_data(url=url)
-                return res.json() if res else {}
-            plex = service.instance.get_plex()
-            plexitem = plex.library.fetchItem(ekey=itemid)
-            iteminfo = {
-                "Id": plexitem.key,
-                "Name": plexitem.title,
-                "Type": "Series" if "show" in getattr(plexitem, "TYPE", "") else "Movie",
-            }
-            return iteminfo
+            self.subscribechain = SubscribeChain()
         except Exception as err:
-            logger.warning(f"获取媒体库条目详情失败：server={server} itemid={itemid} err={err}")
-            return {}
+            logger.warning(f"豆瓣即将开播订阅：获取订阅链失败：{err}")
+            self.subscribechain = None
 
-    def __get_media_server_items(self, server: str, server_type: str, parentid: str, mtype: str = None) -> dict:
-        service = self.__get_active_media_service(server=server, server_type=server_type)
-        if not service:
-            logger.warning(f"未找到媒体服务器实例：server={server} type={server_type}")
-            return {}
+        return self.subscribechain
 
-        try:
-            if server_type == "emby":
-                url = f"[HOST]emby/Users/[USER]/Items?ParentId={parentid}&api_key=[APIKEY]"
-                res = service.instance.get_data(url=url)
-                data = res.json() if res else {}
-            elif server_type == "jellyfin":
-                url = f"[HOST]Users/[USER]/Items?ParentId={parentid}&api_key=[APIKEY]"
-                res = service.instance.get_data(url=url)
-                data = res.json() if res else {}
-            else:
-                plex = service.instance.get_plex()
-                plexitem = plex.library.fetchItem(ekey=parentid)
-                data = {"Items": []}
-                if mtype and "Season" in mtype:
-                    for season in plexitem.seasons():
-                        data["Items"].append(
-                            {
-                                "Name": season.title,
-                                "Id": season.key,
-                                "IndexNumber": season.seasonNumber,
-                                "Type": "Season",
-                            }
-                        )
-                elif mtype and "Episode" in mtype:
-                    for episode in plexitem.episodes():
-                        data["Items"].append(
-                            {
-                                "Name": episode.title,
-                                "Id": episode.key,
-                                "IndexNumber": episode.episodeNumber,
-                                "Type": "Episode",
-                            }
-                        )
-                return data
+    def __subscription_exists(self, subscribe_chain: Optional[SubscribeChain], meta: MetaInfo, mediainfo: Any) -> bool:
+        if not subscribe_chain:
+            return False
 
-            items = data.get("Items") or []
-            if mtype:
-                filtered = []
-                for item in items:
-                    item_type = str(item.get("Type") or "")
-                    if item_type.lower() == mtype.lower():
-                        filtered.append(item)
-                data["Items"] = filtered
-            return data
-        except Exception as err:
-            logger.warning(f"获取媒体库子项失败：server={server} parentid={parentid} mtype={mtype} err={err}")
-            return {}
+        exists_method = getattr(subscribe_chain, "exists", None)
+        if not callable(exists_method):
+            return False
 
-    def __collect_library_season_episode_map(self, mediainfo: MediaInfo) -> Dict[int, set]:
-        season_episode_map: Dict[int, set] = {}
+        tmdbid = self.__get_media_tmdbid(mediainfo)
+        title = self.__get_media_title(mediainfo) or getattr(meta, "title", None) or ""
+        year = self.__get_media_year(mediainfo) or getattr(meta, "year", None) or ""
 
-        try:
-            existsinfo = self.chain.media_exists(mediainfo=mediainfo)
-        except Exception as err:
-            logger.warning(f"查询媒体库存在状态失败：{mediainfo.title_year} err={err}")
-            return season_episode_map
+        attempts = [
+            {"mediainfo": mediainfo, "meta": meta},
+            {"mediainfo": mediainfo},
+            {"meta": meta},
+        ]
+        if tmdbid:
+            attempts.append({"tmdbid": tmdbid, "mtype": MediaType.TV})
+        if title:
+            attempts.append({"title": title, "year": year, "mtype": MediaType.TV})
 
-        if not existsinfo or not getattr(existsinfo, "itemid", None):
-            logger.info(f"{mediainfo.title_year} 在媒体库中不存在，无法获取季集信息")
-            return season_episode_map
-
-        server = getattr(existsinfo, "server", None)
-        server_type = getattr(existsinfo, "server_type", None)
-        itemid = getattr(existsinfo, "itemid", None)
-        if not server or not server_type or not itemid:
-            logger.warning(f"{mediainfo.title_year} 媒体库定位信息不完整：server={server} type={server_type} itemid={itemid}")
-            return season_episode_map
-
-        iteminfo = self.__get_media_server_iteminfo(server=server, server_type=server_type, itemid=itemid)
-        item_type = str(iteminfo.get("Type") or "")
-        if item_type and "Series" not in item_type and "show" not in item_type.lower():
-            logger.info(f"{mediainfo.title_year} 媒体库条目不是剧集类型：{item_type}")
-            return season_episode_map
-
-        seasons = self.__get_media_server_items(server=server, server_type=server_type, parentid=itemid, mtype="Season")
-        season_items = seasons.get("Items") or []
-        for season in season_items:
-            season_no = season.get("IndexNumber")
+        for kwargs in attempts:
             try:
-                season_no = int(season_no)
-            except Exception:
+                result = exists_method(**kwargs)
+                if result is not None:
+                    return self.__result_to_bool(result)
+            except TypeError:
                 continue
-            if season_no <= 0:
-                continue
-
-            season_episode_map.setdefault(season_no, set())
-            season_id = season.get("Id")
-            if not season_id:
-                continue
-
-            episodes = self.__get_media_server_items(
-                server=server,
-                server_type=server_type,
-                parentid=season_id,
-                mtype="Episode",
-            )
-            for episode in episodes.get("Items") or []:
-                episode_no = episode.get("IndexNumber")
-                try:
-                    episode_no = int(episode_no)
-                except Exception:
-                    continue
-                if episode_no > 0:
-                    season_episode_map[season_no].add(episode_no)
-
-        logger.info(
-            f"{mediainfo.title_year} 媒体库季集信息："
-            f"{ {season: sorted(list(episodes)) for season, episodes in season_episode_map.items()} }"
-        )
-        return season_episode_map
-
-    def __get_tmdb_previous_season_map(self, mediainfo: MediaInfo, current_season: int) -> Dict[int, set]:
-        tmdb_season_map: Dict[int, set] = {}
-
-        for season in range(1, current_season):
-            try:
-                season_info = self.chain.tmdb_info(
-                    tmdbid=mediainfo.tmdb_id,
-                    mtype=mediainfo.type,
-                    season=season,
-                ) or {}
-                episodes = season_info.get("episodes") or []
-                episode_numbers = set()
-                for episode in episodes:
-                    episode_number = episode.get("episode_number") or episode.get("EpisodeNumber") or episode.get("IndexNumber")
-                    try:
-                        episode_number = int(episode_number)
-                    except Exception:
-                        continue
-                    if episode_number > 0:
-                        episode_numbers.add(episode_number)
-                tmdb_season_map[season] = episode_numbers
             except Exception as err:
-                logger.warning(f"获取 TMDB 季信息失败：tmdb={mediainfo.tmdb_id} season={season} err={err}")
-                tmdb_season_map[season] = set()
-
-        logger.info(
-            f"{mediainfo.title_year} TMDB 往季信息："
-            f"{ {season: sorted(list(episodes)) for season, episodes in tmdb_season_map.items()} }"
-        )
-        return tmdb_season_map
-
-    def __get_previous_season_status(
-        self,
-        mediainfo: MediaInfo,
-        current_season: int,
-    ) -> Optional[str]:
-        if current_season <= 1:
-            return None
-
-        library_map = self.__collect_library_season_episode_map(mediainfo=mediainfo)
-        tmdb_map = self.__get_tmdb_previous_season_map(mediainfo=mediainfo, current_season=current_season)
-
-        if not tmdb_map:
-            return "未知"
-
-        missing_parts: List[str] = []
-        incomplete_parts: List[str] = []
-
-        for season in range(1, current_season):
-            tmdb_episodes = tmdb_map.get(season) or set()
-            library_episodes = library_map.get(season) or set()
-
-            if not library_episodes:
-                missing_parts.append(f"第{season}季")
+                logger.warning(f"豆瓣即将开播订阅：检查订阅存在状态失败：{err}")
                 continue
 
-            if tmdb_episodes:
-                missing_episodes = sorted(list(tmdb_episodes - library_episodes))
-                if missing_episodes:
-                    preview = "、".join([f"E{episode:02d}" for episode in missing_episodes[:5]])
-                    suffix = "..." if len(missing_episodes) > 5 else ""
-                    incomplete_parts.append(f"第{season}季缺{preview}{suffix}")
+        return False
 
-        if not missing_parts and not incomplete_parts:
-            return "已入库"
+    def __is_in_library(self, meta: MetaInfo, mediainfo: Any) -> bool:
+        media_exists = getattr(self.chain, "media_exists", None)
+        if callable(media_exists):
+            attempts = [
+                {"mediainfo": mediainfo},
+                {"mediainfo": mediainfo, "meta": meta},
+                {"meta": meta, "mediainfo": mediainfo},
+            ]
+            for kwargs in attempts:
+                try:
+                    result = media_exists(**kwargs)
+                    if result is None:
+                        continue
+                    if hasattr(result, "itemid"):
+                        return bool(getattr(result, "itemid", None))
+                    return self.__result_to_bool(result)
+                except TypeError:
+                    continue
+                except Exception as err:
+                    logger.warning(f"豆瓣即将开播订阅：media_exists 调用失败：{err}")
+                    break
 
-        parts: List[str] = []
-        if missing_parts:
-            parts.append("缺少" + "、".join(missing_parts))
-        if incomplete_parts:
-            parts.append("；".join(incomplete_parts))
-        return "；".join(parts)
+        try:
+            module = importlib.import_module("app.chain.download")
+            chain_cls = getattr(module, "DownloadChain", None)
+            if not chain_cls:
+                return False
+
+            download_chain = chain_cls()
+            method = getattr(download_chain, "get_no_exists_info", None)
+            if not callable(method):
+                return False
+
+            attempts = [
+                {"meta": meta, "mediainfo": mediainfo},
+                {"meta": meta},
+            ]
+            for kwargs in attempts:
+                try:
+                    result = method(**kwargs)
+                    if result is None:
+                        continue
+                    if isinstance(result, tuple):
+                        return bool(result[0])
+                    return bool(result)
+                except TypeError:
+                    continue
+                except Exception as err:
+                    logger.warning(f"豆瓣即将开播订阅：get_no_exists_info 调用失败：{err}")
+                    break
+        except Exception:
+            return False
+
+        return False
+
+    @staticmethod
+    def __compact_kwargs(kwargs: Dict[str, Any], keep_false_keys: Optional[List[str]] = None) -> Dict[str, Any]:
+        keep_false_keys = keep_false_keys or []
+        compacted = {}
+        for key, value in kwargs.items():
+            if value is None:
+                continue
+            if value is False and key not in keep_false_keys:
+                continue
+            if isinstance(value, str) and value == "":
+                continue
+            compacted[key] = value
+        return compacted
+
+    @staticmethod
+    def __parse_add_result(result: Any) -> Tuple[bool, str]:
+        if isinstance(result, (list, tuple)):
+            sid = result[0] if len(result) > 0 else None
+            msg = result[1] if len(result) > 1 else ""
+            return bool(sid), str(msg or "")
+        return bool(result), ""
+
+    def __add_subscription(
+        self,
+        subscribe_chain: Optional[SubscribeChain],
+        meta: MetaInfo,
+        mediainfo: Any,
+        douban_id: Optional[str],
+    ) -> Tuple[bool, str]:
+        if not subscribe_chain:
+            return False, "订阅链不可用"
+
+        add_method = getattr(subscribe_chain, "add", None)
+        if not callable(add_method):
+            return False, "当前版本未提供订阅接口"
+
+        season = getattr(meta, "begin_season", None) or self.__get_media_season(mediainfo) or 1
+        base_kwargs = {
+            "title": self.__get_media_title(mediainfo) or getattr(meta, "title", None) or "",
+            "year": self.__get_media_year(mediainfo) or getattr(meta, "year", None) or "",
+            "mtype": MediaType.TV,
+            "tmdbid": self.__get_media_tmdbid(mediainfo),
+            "doubanid": self.__get_media_doubanid(mediainfo) or douban_id,
+            "season": season,
+            "exist_ok": True,
+            "username": self.plugin_name,
+            "message": False,
+        }
+
+        variant_definitions = [
+            self.__compact_kwargs(base_kwargs, keep_false_keys=["message"]),
+            self.__compact_kwargs({k: v for k, v in base_kwargs.items() if k not in {"message"}}),
+            self.__compact_kwargs({k: v for k, v in base_kwargs.items() if k not in {"message", "doubanid"}}),
+            self.__compact_kwargs({k: v for k, v in base_kwargs.items() if k not in {"message", "doubanid", "season"}}),
+            self.__compact_kwargs({k: v for k, v in base_kwargs.items() if k not in {"message", "doubanid", "season", "exist_ok"}}),
+            self.__compact_kwargs(
+                {
+                    "title": base_kwargs.get("title"),
+                    "year": base_kwargs.get("year"),
+                    "mtype": MediaType.TV,
+                    "tmdbid": base_kwargs.get("tmdbid"),
+                }
+            ),
+            self.__compact_kwargs(
+                {
+                    "title": base_kwargs.get("title"),
+                    "year": base_kwargs.get("year"),
+                    "mtype": MediaType.TV,
+                }
+            ),
+        ]
+
+        variants: List[Dict[str, Any]] = []
+        seen = set()
+        for item in variant_definitions:
+            key = tuple(sorted((k, str(v)) for k, v in item.items()))
+            if key in seen:
+                continue
+            seen.add(key)
+            variants.append(item)
+
+        last_error = "添加订阅失败"
+        for kwargs in variants:
+            try:
+                result = add_method(**kwargs)
+                success, message = self.__parse_add_result(result)
+                if success:
+                    return True, message or "添加订阅成功"
+                if message:
+                    last_error = message
+            except TypeError:
+                continue
+            except Exception as err:
+                last_error = str(err)
+                logger.warning(f"豆瓣即将开播订阅：添加订阅失败，参数={list(kwargs.keys())}，错误：{err}")
+                continue
+
+        return False, last_error
 
     def __build_notify_unique_key(self, douban_id: Optional[str], title: str, air_date: Optional[str]) -> str:
         return f"air_notify:{douban_id or title}:{air_date or 'unknown'}"
@@ -1228,201 +1100,415 @@ class DoubanComingNotice(_PluginBase):
         notify_history.append(item)
         self.save_data("notify_history", notify_history)
 
+    def __post_message_compat(self, title: str, text: str, image: Optional[str] = None):
+        kwargs = {
+            "title": title,
+            "text": text,
+        }
+        if image:
+            kwargs["image"] = image
+
+        try:
+            self.post_message(**kwargs)
+            return
+        except Exception:
+            pass
+
+        try:
+            self.post_message(title=title, text=text)
+        except Exception as err:
+            logger.error(f"豆瓣即将开播订阅：发送消息失败：{err}")
+
     def __send_air_notify_message(
         self,
         title: str,
-        mediainfo: MediaInfo,
+        mediainfo: Any,
         douban_id: Optional[str],
         wish_count: int,
         air_date: Optional[str],
         subscribed: bool,
-        previous_season_status: Optional[str],
         poster: Optional[str],
     ):
         if not self._notify_before_air:
             return
 
+        genres = self.__get_media_genres(mediainfo)
+        genre_text = " / ".join(genres) if genres else "-"
         douban_link = f"https://movie.douban.com/subject/{douban_id}" if douban_id else "-"
-        media_type = mediainfo.type.value if getattr(mediainfo, "type", None) else "电视剧"
+        tmdbid = self.__get_media_tmdbid(mediainfo)
+        year = self.__get_media_year(mediainfo) or "-"
         subscribed_text = "已订阅" if subscribed else "未订阅"
 
         lines = [
             f"🎬 名称：{title}",
-            f"📂 类型：{media_type}",
+            "📂 类型：电视剧",
+            f"🏷️ 分类：{genre_text}",
             f"⏰ 开播时间：{air_date or '-'}",
             f"👀 想看人数：{wish_count}",
             f"🔔 订阅状态：{subscribed_text}",
+            f"📅 年份：{year}",
+            f"🆔 TMDB ID：{tmdbid or '-'}",
+            f"🔗 豆瓣链接：{douban_link}",
         ]
-
-        if previous_season_status:
-            lines.append(f"📦 往季状态：{previous_season_status}")
-
-        lines.extend(
-            [
-                f"📅 年份：{mediainfo.year or '-'}",
-                f"🆔 TMDB ID：{mediainfo.tmdb_id or '-'}",
-                f"🔗 豆瓣链接：{douban_link}",
-            ]
+        self.__post_message_compat(
+            title="**📺 豆瓣开播提醒 ✨**",
+            text="\n".join(lines),
+            image=poster,
         )
 
-        text = "\n".join(lines)
-
+    def __get_rss_info(self, addr: str) -> List[dict]:
         try:
-            self.post_message(
-                title="**📺 豆瓣开播提醒 ✨**",
-                text=text,
-                image=poster,
-            )
+            proxy = getattr(settings, "PROXY", None)
+            response = RequestUtils(proxies=proxy).get_res(addr) if self._proxy else RequestUtils().get_res(addr)
+            if not response:
+                return []
+
+            dom_tree = xml.dom.minidom.parseString(response.text)
+            items = dom_tree.getElementsByTagName("item")
+            result: List[dict] = []
+
+            for item in items:
+                try:
+                    title = self.__tag_value(item, "title", default="")
+                    link = self.__tag_value(item, "link", default="")
+                    description = self.__tag_value(item, "description", default="")
+                    item_xml = item.toxml() if hasattr(item, "toxml") else description
+
+                    if not title and not link:
+                        continue
+
+                    douban_match = re.search(r"/subject/(\d+)", link) or re.search(r"/(\d+)(?=/|$)", link)
+                    douban_id = douban_match.group(1) if douban_match else None
+
+                    clean_description = self.__strip_html(description)
+                    result.append(
+                        {
+                            "title": title.strip(),
+                            "link": str(link or "").strip(),
+                            "description": clean_description,
+                            "raw_description": description or "",
+                            "poster": self.__extract_poster(item_xml) or self.__extract_poster(description),
+                            "doubanid": douban_id,
+                            "wish_count": self.__extract_wish_count(description),
+                            "year": self.__extract_year(clean_description),
+                            "air_date": self.__extract_air_date(description),
+                        }
+                    )
+                except Exception as item_err:
+                    logger.error(f"豆瓣即将开播订阅：解析 RSS 条目失败：{item_err}")
+                    continue
+
+            return result
         except Exception as err:
-            logger.error(f"发送开播提醒失败：{err}")
+            logger.error(f"豆瓣即将开播订阅：获取 RSS 失败：{err}")
+            return []
+
+    @staticmethod
+    def __days_until_air(air_date_str: Optional[str]) -> Optional[int]:
+        if not air_date_str:
+            return None
+        try:
+            air_date = datetime.datetime.strptime(air_date_str, "%Y-%m-%d").date()
+            return (air_date - datetime.datetime.now().date()).days
+        except Exception:
+            return None
+
+    def __hours_until_air(self, air_date_str: Optional[str]) -> Optional[float]:
+        if not air_date_str:
+            return None
+        try:
+            air_date = datetime.datetime.strptime(air_date_str, "%Y-%m-%d").date()
+            air_datetime = self.__get_timezone().localize(datetime.datetime.combine(air_date, datetime.time.min))
+            return (air_datetime - self.__now()).total_seconds() / 3600
+        except Exception:
+            return None
+
+    @staticmethod
+    def __history_unique_key(title: str, douban_id: Optional[str]) -> str:
+        return f"doubancomingnotice:{douban_id or title}"
+
+    def __build_history_card(self, history: Dict[str, Any]) -> Dict[str, Any]:
+        title = history.get("title") or "-"
+        poster = history.get("poster") or ""
+        mtype = history.get("type") or "电视剧"
+        genres = " / ".join(history.get("genres") or []) or "-"
+        wish_count = history.get("wish_count") or "-"
+        air_date = history.get("air_date") or "-"
+        subscribed = "已订阅" if history.get("subscribed") else "未订阅"
+        notified = "已提醒" if history.get("air_notify_sent") else "未提醒"
+        time_str = history.get("time") or "-"
+        overview = history.get("overview") or "暂无简介"
+        douban_id = history.get("doubanid")
+        douban_url = f"https://movie.douban.com/subject/{douban_id}" if douban_id else ""
+
+        poster_block = {
+            "component": "div",
+            "props": {
+                "style": "width: 96px; min-width: 96px; height: 144px; margin-right: 12px;",
+            },
+            "content": [
+                {
+                    "component": "VImg",
+                    "props": {
+                        "src": poster,
+                        "height": 144,
+                        "width": 96,
+                        "aspect-ratio": "2/3",
+                        "class": "rounded-lg shadow object-cover bg-grey-lighten-3",
+                        "cover": True,
+                    },
+                }
+            ],
+        } if poster else {
+            "component": "div",
+            "props": {
+                "class": "d-flex align-center justify-center text-caption text-medium-emphasis",
+                "style": "width: 96px; min-width: 96px; height: 144px; margin-right: 12px; background: rgba(0,0,0,0.04); border-radius: 12px;",
+            },
+            "text": "暂无海报",
+        }
+
+        title_block = {
+            "component": "span",
+            "props": {
+                "class": "text-body-1 font-weight-bold",
+                "style": "line-height: 1.2rem;",
+            },
+            "text": title,
+        }
+        if douban_url:
+            title_block = {
+                "component": "a",
+                "props": {
+                    "href": douban_url,
+                    "target": "_blank",
+                    "style": "color: inherit; text-decoration: none; line-height: 1.2rem;",
+                    "class": "text-body-1 font-weight-bold",
+                },
+                "text": title,
+            }
+
+        return {
+            "component": "VCard",
+            "props": {
+                "class": "h-100",
+                "style": "min-height: 250px; border-radius: 14px; overflow: hidden;",
+            },
+            "content": [
+                {
+                    "component": "div",
+                    "props": {
+                        "class": "d-flex flex-nowrap flex-row h-100",
+                        "style": "padding: 12px;",
+                    },
+                    "content": [
+                        poster_block,
+                        {
+                            "component": "div",
+                            "props": {
+                                "class": "d-flex flex-column justify-space-between flex-grow-1",
+                                "style": "min-width: 0;",
+                            },
+                            "content": [
+                                {
+                                    "component": "div",
+                                    "content": [
+                                        {
+                                            "component": "div",
+                                            "props": {
+                                                "style": "display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; min-height: 2.4rem;",
+                                            },
+                                            "content": [title_block],
+                                        },
+                                        {
+                                            "component": "VCardText",
+                                            "props": {
+                                                "class": "pa-0 pt-1 text-body-2",
+                                                "style": "line-height: 1rem;",
+                                            },
+                                            "text": f"类型：{mtype}",
+                                        },
+                                        {
+                                            "component": "VCardText",
+                                            "props": {
+                                                "class": "pa-0 text-body-2",
+                                                "style": "line-height: 1rem;",
+                                            },
+                                            "text": f"分类：{genres}",
+                                        },
+                                        {
+                                            "component": "VCardText",
+                                            "props": {
+                                                "class": "pa-0 text-body-2",
+                                                "style": "line-height: 1rem;",
+                                            },
+                                            "text": f"想看：{wish_count}",
+                                        },
+                                        {
+                                            "component": "VCardText",
+                                            "props": {
+                                                "class": "pa-0 text-body-2",
+                                                "style": "line-height: 1rem;",
+                                            },
+                                            "text": f"开播：{air_date}",
+                                        },
+                                        {
+                                            "component": "VCardText",
+                                            "props": {
+                                                "class": "pa-0 text-body-2",
+                                                "style": "line-height: 1rem;",
+                                            },
+                                            "text": f"状态：{subscribed} / {notified}",
+                                        },
+                                        {
+                                            "component": "VCardText",
+                                            "props": {
+                                                "class": "pa-0 text-caption text-medium-emphasis",
+                                                "style": "line-height: 1rem;",
+                                            },
+                                            "text": f"处理时间：{time_str}",
+                                        },
+                                        {
+                                            "component": "VCardText",
+                                            "props": {
+                                                "class": "pa-0 pt-2 text-caption",
+                                                "style": "display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; line-height: 1rem; min-height: 3rem;",
+                                            },
+                                            "text": overview,
+                                        },
+                                    ],
+                                },
+                                {
+                                    "component": "VCardActions",
+                                    "props": {
+                                        "class": "pa-0 pt-2",
+                                    },
+                                    "content": [
+                                        {
+                                            "component": "VBtn",
+                                            "props": {
+                                                "color": "error",
+                                                "variant": "tonal",
+                                                "size": "small",
+                                            },
+                                            "text": "删除记录",
+                                            "events": {
+                                                "click": {
+                                                    "api": "plugin/DoubanComingNotice/delete_history",
+                                                    "method": "get",
+                                                    "params": {
+                                                        "key": history.get("unique"),
+                                                        "apikey": settings.API_TOKEN,
+                                                    },
+                                                }
+                                            },
+                                        }
+                                    ],
+                                },
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
 
     def __refresh_rss(self):
-        logger.info("开始刷新豆瓣即将开播订阅 ...")
+        logger.info("豆瓣即将开播订阅：开始刷新 RSS 数据")
         rss_url = self.__build_rss_url()
-        logger.info(f"请求地址：{rss_url}")
+        logger.info(f"豆瓣即将开播订阅：请求地址 {rss_url}")
 
-        if self._clearflag:
-            history: List[dict] = []
-            self.save_data("history", history)
-            self.save_data("notify_history", [])
-        else:
-            history = self.get_data("history") or []
-
+        history: List[dict] = self.get_data("history") or []
         rss_infos = self.__get_rss_info(rss_url)
+
         if not rss_infos:
-            logger.warning(f"未从 RSS 获取到数据：{rss_url}")
-            self._clearflag = False
+            logger.warning(f"豆瓣即将开播订阅：未从 RSS 获取到数据 {rss_url}")
             return
 
-        logger.info(f"共获取到 {len(rss_infos)} 条 RSS 数据")
+        subscribe_chain = self.__get_subscribe_chain()
         added_count = 0
 
         for rss_info in rss_infos:
             try:
                 if self._event.is_set():
-                    logger.info("订阅服务停止")
+                    logger.info("豆瓣即将开播订阅：任务已停止")
                     return
 
-                title = rss_info.get("title")
+                title = str(rss_info.get("title") or "").strip()
+                if not title:
+                    continue
+
                 douban_id = rss_info.get("doubanid")
                 description = rss_info.get("description") or ""
                 wish_count = self.__safe_positive_int(rss_info.get("wish_count"), 0)
                 year = rss_info.get("year")
-
-                if not title:
-                    logger.warning("RSS 条目标题为空，跳过")
-                    continue
-
-                title_season = self.__extract_season_from_title(title)
-
-                if title_season:
-                    logger.info(f"{title} 从标题中解析到季号：S{title_season}")
+                air_date = rss_info.get("air_date")
 
                 if wish_count < self._wish_count_threshold:
-                    logger.info(f"{title} 想看人数 {wish_count} 低于阈值 {self._wish_count_threshold}，跳过")
+                    logger.info(
+                        f"豆瓣即将开播订阅：{title} 想看人数 {wish_count} 低于阈值 {self._wish_count_threshold}，已跳过"
+                    )
                     continue
 
-                meta = MetaInfo(title)
-                if year:
-                    meta.year = year
-                meta.type = MediaType.TV
-
-                mediainfo: Optional[MediaInfo] = None
-                if douban_id:
-                    if settings.RECOGNIZE_SOURCE == "themoviedb":
-                        tmdbinfo = MediaChain().get_tmdbinfo_by_doubanid(doubanid=douban_id, mtype=meta.type)
-                        if not tmdbinfo:
-                            logger.warning(f"未能通过豆瓣ID {douban_id} 获取 TMDB 信息，标题：{title}")
-                            continue
-                        meta.type = tmdbinfo.get("media_type")
-                        mediainfo = self.chain.recognize_media(meta=meta, tmdbid=tmdbinfo.get("id"))
-                        if not mediainfo:
-                            logger.warning(f"TMDBID {tmdbinfo.get('id')} 未识别到媒体信息")
-                            continue
-                    else:
-                        mediainfo = self.chain.recognize_media(meta=meta, doubanid=douban_id)
-                        if not mediainfo:
-                            logger.warning(f"豆瓣ID {douban_id} 未识别到媒体信息")
-                            continue
-                else:
-                    mediainfo = self.chain.recognize_media(meta=meta)
-                    if not mediainfo:
-                        logger.warning(f"未识别到媒体信息，标题：{title}")
-                        continue
-
-                if mediainfo.type != MediaType.TV:
-                    logger.info(f"{mediainfo.title_year} 不是电视剧类型，跳过")
+                mediainfo, meta = self.__recognize_media_compat(title=title, year=year, douban_id=douban_id)
+                if not mediainfo or not meta:
+                    logger.warning(f"豆瓣即将开播订阅：未识别到媒体信息，标题：{title}")
                     continue
 
-                genres = self.__get_media_genres(mediainfo)
-                current_season = self.__get_current_season(meta, mediainfo, title_season=title_season)
-
-                if title_season and getattr(meta, "begin_season", None) != title_season:
-                    meta.begin_season = title_season
-
-                logger.info(f"{title} 开播日期直接使用 TMDB 获取，使用季号：S{current_season}")
-                air_date = self.__fetch_tmdb_air_date(mediainfo=mediainfo, current_season=current_season)
+                if not self.__is_tv_media(mediainfo):
+                    logger.info(f"豆瓣即将开播订阅：{self.__get_media_title_year(mediainfo)} 不是电视剧类型，已跳过")
+                    continue
 
                 if not air_date:
-                    logger.warning(f"{title} 未从 TMDB 获取到开播日期，后续将跳过依赖开播日期的逻辑")
-                elif not year:
-                    year = air_date[:4]
-                    meta.year = year
+                    air_date = self.__extract_air_date_from_mediainfo(mediainfo)
 
-                exist_flag, _ = DownloadChain().get_no_exists_info(meta=meta, mediainfo=mediainfo)
-                in_library = bool(exist_flag)
+                in_library = self.__is_in_library(meta=meta, mediainfo=mediainfo)
+                subscribed = self.__subscription_exists(subscribe_chain=subscribe_chain, meta=meta, mediainfo=mediainfo)
 
-                previous_season_status = None
-                try:
-                    previous_season_status = self.__get_previous_season_status(
-                        mediainfo=mediainfo,
-                        current_season=current_season,
-                    )
-                except Exception as err:
-                    logger.warning(f"{title} 往季状态判断失败，不影响开播提醒继续发送：{err}")
+                unique_flag = self.__history_unique_key(title=title, douban_id=douban_id)
+                history_item = next((item for item in history if item.get("unique") == unique_flag), None)
 
-                subscribe_chain = SubscribeChain()
-                subscribed = bool(subscribe_chain.exists(mediainfo=mediainfo, meta=meta))
-
-                unique_flag = f"doubancomingnotice: {title} (DB:{douban_id})"
-                history_item = next((h for h in history if h.get("unique") == unique_flag), None)
-
-                # 提前订阅逻辑：每次刷新都重新判断，避免首次出现过早时后续永远不订阅
                 newly_subscribed = False
                 days_until_air = self.__days_until_air(air_date)
                 if days_until_air is None:
-                    logger.info(f"{title} 未解析到开播日期，跳过提前订阅判断")
+                    logger.info(f"豆瓣即将开播订阅：{title} 未解析到开播日期，跳过提前订阅判断")
                 elif days_until_air < 0:
-                    logger.info(f"{title} 已开播 {abs(days_until_air)} 天，跳过订阅")
+                    logger.info(f"豆瓣即将开播订阅：{title} 已开播 {abs(days_until_air)} 天，跳过订阅")
                 elif days_until_air > self._advance_days:
-                    logger.info(f"{title} 距开播还有 {days_until_air} 天，超过提前订阅阈值 {self._advance_days} 天")
-                elif in_library:
-                    logger.info(f"{mediainfo.title_year} 媒体库中已存在")
-                elif subscribed:
-                    logger.info(f"{mediainfo.title_year} 订阅已存在")
-                else:
-                    subscribe_chain.add(
-                        title=mediainfo.title,
-                        year=mediainfo.year,
-                        mtype=mediainfo.type,
-                        tmdbid=mediainfo.tmdb_id,
-                        season=meta.begin_season,
-                        exist_ok=True,
-                        username="豆瓣即将开播",
+                    logger.info(
+                        f"豆瓣即将开播订阅：{title} 距开播还有 {days_until_air} 天，超过提前订阅阈值 {self._advance_days} 天"
                     )
-                    subscribed = True
-                    newly_subscribed = True
-                    logger.info(f"已添加订阅：{mediainfo.title_year}")
+                elif in_library:
+                    logger.info(f"豆瓣即将开播订阅：{self.__get_media_title_year(mediainfo)} 媒体库中已存在")
+                elif subscribed:
+                    logger.info(f"豆瓣即将开播订阅：{self.__get_media_title_year(mediainfo)} 订阅已存在")
+                else:
+                    success, message = self.__add_subscription(
+                        subscribe_chain=subscribe_chain,
+                        meta=meta,
+                        mediainfo=mediainfo,
+                        douban_id=douban_id,
+                    )
+                    if success:
+                        subscribed = True
+                        newly_subscribed = True
+                        added_count += 1
+                        logger.info(f"豆瓣即将开播订阅：已添加订阅 {self.__get_media_title_year(mediainfo)}")
+                    else:
+                        logger.warning(f"豆瓣即将开播订阅：添加订阅失败 {title}，原因：{message}")
 
-                now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                now_str = self.__now().strftime("%Y-%m-%d %H:%M:%S")
+                poster = rss_info.get("poster") or self.__get_media_poster(mediainfo)
+                genres = self.__get_media_genres(mediainfo)
+                overview = self.__get_media_overview(mediainfo) or description
+
                 if not history_item:
                     history_item = {
                         "title": title,
-                        "type": mediainfo.type.value,
-                        "year": mediainfo.year,
-                        "poster": mediainfo.get_poster_image(),
-                        "overview": mediainfo.overview or description,
-                        "tmdbid": mediainfo.tmdb_id,
+                        "type": self.__get_media_type_value(mediainfo) or "电视剧",
+                        "year": self.__get_media_year(mediainfo) or year,
+                        "poster": poster,
+                        "overview": overview,
+                        "tmdbid": self.__get_media_tmdbid(mediainfo),
                         "doubanid": douban_id,
                         "wish_count": wish_count,
                         "air_date": air_date,
@@ -1437,77 +1523,77 @@ class DoubanComingNotice(_PluginBase):
                     history_item.update(
                         {
                             "title": title,
-                            "type": mediainfo.type.value,
-                            "year": mediainfo.year,
-                            "poster": mediainfo.get_poster_image(),
-                            "overview": mediainfo.overview or description,
-                            "tmdbid": mediainfo.tmdb_id,
-                            "doubanid": douban_id,
+                            "type": self.__get_media_type_value(mediainfo) or history_item.get("type") or "电视剧",
+                            "year": self.__get_media_year(mediainfo) or year or history_item.get("year"),
+                            "poster": poster or history_item.get("poster"),
+                            "overview": overview or history_item.get("overview"),
+                            "tmdbid": self.__get_media_tmdbid(mediainfo) or history_item.get("tmdbid"),
+                            "doubanid": douban_id or history_item.get("doubanid"),
                             "wish_count": wish_count,
                             "air_date": air_date or history_item.get("air_date"),
-                            "genres": genres,
+                            "genres": genres or history_item.get("genres") or [],
                             "subscribed": subscribed,
                             "time": now_str,
                         }
                     )
 
-                if newly_subscribed:
-                    added_count += 1
+                if not self._notify_before_air:
+                    continue
 
-                # 开播前提醒逻辑
-                if self._notify_before_air:
-                    hours_until_air = self.__hours_until_air(air_date)
-                    if hours_until_air is None:
-                        logger.info(f"{title} 未解析到开播日期，跳过开播提醒")
-                        continue
+                hours_until_air = self.__hours_until_air(air_date)
+                if hours_until_air is None:
+                    logger.info(f"豆瓣即将开播订阅：{title} 未解析到开播日期，跳过开播提醒")
+                    continue
 
-                    if hours_until_air < 0:
-                        logger.info(f"{title} 已开播，跳过开播提醒")
-                        continue
+                if hours_until_air < 0:
+                    logger.info(f"豆瓣即将开播订阅：{title} 已开播，跳过开播提醒")
+                    continue
 
-                    if hours_until_air > self._notify_hours:
-                        logger.info(f"{title} 距开播还有 {hours_until_air:.2f} 小时，未进入提醒窗口")
-                        continue
+                if hours_until_air > self._notify_hours:
+                    logger.info(f"豆瓣即将开播订阅：{title} 距开播还有 {hours_until_air:.2f} 小时，未进入提醒窗口")
+                    continue
 
-                    notify_unique = self.__build_notify_unique_key(douban_id, title, air_date)
-                    if self.__has_sent_air_notify(notify_unique):
-                        logger.info(f"{title} 开播提醒已发送过，跳过")
-                        continue
-
-                    self.__send_air_notify_message(
-                        title=title,
-                        mediainfo=mediainfo,
-                        douban_id=douban_id,
-                        wish_count=wish_count,
-                        air_date=air_date,
-                        subscribed=subscribed,
-                        previous_season_status=previous_season_status,
-                        poster=history_item.get("poster") or mediainfo.get_poster_image(),
-                    )
-
-                    self.__save_air_notify_history(
-                        {
-                            "unique": notify_unique,
-                            "title": title,
-                            "doubanid": douban_id,
-                            "tmdbid": mediainfo.tmdb_id,
-                            "type": mediainfo.type.value,
-                            "genres": genres,
-                            "wish_count": wish_count,
-                            "air_date": air_date,
-                            "subscribed": subscribed,
-                            "in_library": in_library,
-                            "notified_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        }
-                    )
-
+                notify_unique = self.__build_notify_unique_key(douban_id, title, air_date)
+                if self.__has_sent_air_notify(notify_unique):
+                    logger.info(f"豆瓣即将开播订阅：{title} 开播提醒已发送过，跳过")
                     history_item["air_notify_sent"] = True
-                    history_item["subscribed"] = subscribed
+                    continue
 
-                    logger.info(f"{title} 已发送开播提醒")
+                self.__send_air_notify_message(
+                    title=title,
+                    mediainfo=mediainfo,
+                    douban_id=douban_id,
+                    wish_count=wish_count,
+                    air_date=air_date,
+                    subscribed=subscribed,
+                    poster=poster,
+                )
+
+                self.__save_air_notify_history(
+                    {
+                        "unique": notify_unique,
+                        "title": title,
+                        "doubanid": douban_id,
+                        "tmdbid": self.__get_media_tmdbid(mediainfo),
+                        "type": self.__get_media_type_value(mediainfo) or "电视剧",
+                        "genres": genres,
+                        "wish_count": wish_count,
+                        "air_date": air_date,
+                        "subscribed": subscribed,
+                        "in_library": in_library,
+                        "notified_at": now_str,
+                    }
+                )
+
+                history_item["air_notify_sent"] = True
+                history_item["subscribed"] = subscribed
+
+                if newly_subscribed:
+                    logger.info(f"豆瓣即将开播订阅：{title} 已完成订阅并进入提醒流程")
+                else:
+                    logger.info(f"豆瓣即将开播订阅：{title} 已发送开播提醒")
             except Exception as err:
-                logger.error(f"处理条目失败：{err}")
+                logger.error(f"豆瓣即将开播订阅：处理条目失败，错误：{err}")
 
         self.save_data("history", history)
-        self._clearflag = False
-        logger.info(f"豆瓣即将开播订阅刷新完成，本次新增 {added_count} 条")
+        logger.info(f"豆瓣即将开播订阅：刷新完成，本次新增订阅 {added_count} 条")
