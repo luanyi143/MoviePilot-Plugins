@@ -19,7 +19,7 @@
     "icon": "https://raw.githubusercontent.com/luanyi143/MoviePilot-Plugins/main/icons/Douban_A.png",
     "author": "luanyi143",
     "level": 2
-  }
+  },
   "DoubanTvComing": {
     "name": "豆瓣即将播出订阅",
     "description": "豆瓣即将播出剧集，想看人数超过阈值后自动添加订阅。",
