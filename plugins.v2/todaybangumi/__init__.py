@@ -28,7 +28,7 @@ class TodayBangumi(_PluginBase):
     plugin_author = "luanyi143"
     author_url = "https://github.com/luanyi143"
     plugin_config_prefix = "todaybangumi_"
-    plugin_order = 14
+    plugin_order = 80
     auth_level = 1
 
     _enabled = False
