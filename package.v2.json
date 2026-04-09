@@ -6,7 +6,7 @@
     "version": "1.0.1",
     "history": {
       "v1.0.1": "优化订阅逻辑，优化静默模式判断逻辑。"
-    }
+    },
     "icon": "https://raw.githubusercontent.com/luanyi143/MoviePilot-Plugins/main/icons/Bangumi_A.jpeg",
     "author": "luanyi143",
     "level": 1
