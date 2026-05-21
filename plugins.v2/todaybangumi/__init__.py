@@ -1,6 +1,10 @@
+import concurrent.futures
 import datetime
 import importlib
+import random
 import re
+import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytz
@@ -13,6 +17,7 @@ from app.core.config import settings
 from app.core.context import MediaInfo
 from app.core.metainfo import MetaInfo
 from app.db.site_oper import SiteOper
+from app.db.subscribe_oper import SubscribeOper
 from app.db.systemconfig_oper import SystemConfigOper
 from app.log import logger
 from app.plugins import _PluginBase
@@ -49,6 +54,7 @@ class TodayBangumi(_PluginBase):
     _summary_image = "https://raw.githubusercontent.com/luanyi143/MoviePilot-Plugins/main/icons/post_message.jpeg"
 
     _scheduler = None
+    _http_semaphore: Optional[threading.Semaphore] = None
     subscribechain: Optional[SubscribeChain] = None
 
     _resolution_options = [
@@ -59,6 +65,7 @@ class TodayBangumi(_PluginBase):
     def init_plugin(self, config: dict = None):
         self.stop_service()
         self.subscribechain = SubscribeChain()
+        self._http_semaphore = threading.Semaphore(3)
 
         config = config or {}
         self._enabled = bool(config.get("enabled", False))
@@ -419,6 +426,7 @@ class TodayBangumi(_PluginBase):
             summary = item.get("summary") or ""
             subject_id = item.get("subject_id") or ""
             bangumi_total_episodes = item.get("bangumi_total_episodes")
+            detected_season = item.get("season") or 1
 
             cards.append(
                 {
@@ -529,16 +537,34 @@ class TodayBangumi(_PluginBase):
                                             "component": "div",
                                             "content": [
                                                 {
-                                                    "component": "VCardText",
-                                                    "props": {
-                                                        "class": "pa-0 text-caption text-primary",
-                                                        "style": "min-height: 16px; line-height: 1rem;",
-                                                    },
-                                                    "text": "点击下方按钮可尝试添加订阅",
+                                                    "component": "VRow",
+                                                    "props": {"dense": True, "class": "mx-0"},
+                                                    "content": [
+                                                        {
+                                                            "component": "VCol",
+                                                            "props": {"cols": 4},
+                                                            "content": [
+                                                                {
+                                                                    "component": "VTextField",
+                                                                    "props": {
+                                                                        "model": f"season_{subject_id}",
+                                                                        "label": "季",
+                                                                        "type": "number",
+                                                                        "min": 1,
+                                                                        "max": 99,
+                                                                        "hide-details": True,
+                                                                        "density": "compact",
+                                                                        "variant": "outlined",
+                                                                        "value": detected_season,
+                                                                    },
+                                                                }
+                                                            ],
+                                                        },
+                                                    ],
                                                 },
                                                 {
                                                     "component": "VCardActions",
-                                                    "props": {"class": "pa-0"},
+                                                    "props": {"class": "pa-0 d-flex ga-2"},
                                                     "content": [
                                                         {
                                                             "component": "VBtn",
@@ -558,10 +584,22 @@ class TodayBangumi(_PluginBase):
                                                                         "title_origin": title_origin,
                                                                         "year": year,
                                                                         "subject_id": subject_id,
+                                                                        "season": detected_season,
                                                                     },
                                                                 }
                                                             },
-                                                        }
+                                                        },
+                                                        {
+                                                            "component": "VBtn",
+                                                            "props": {
+                                                                "color": "grey",
+                                                                "variant": "outlined",
+                                                                "size": "small",
+                                                                "href": link,
+                                                                "target": "_blank",
+                                                            },
+                                                            "text": "跳转Bangumi",
+                                                        },
                                                     ],
                                                 },
                                             ],
@@ -690,12 +728,9 @@ class TodayBangumi(_PluginBase):
             logger.error(f"[TodayBangumi] 刷新 Bangumi 每日放送失败：{err}")
 
     def __auto_subscribe_items(self, items: List[dict]) -> None:
-        success_count = 0
-        fail_details: List[str] = []
-
         logger.info(f"[TodayBangumi] 静默模式已开启，开始自动处理 {len(items)} 条媒体订阅")
 
-        for item in items:
+        def _process(item: dict) -> Tuple[str, str]:
             item_title = item.get("title") or item.get("title_origin") or "未知标题"
             try:
                 success, message = self.__subscribe_item(
@@ -703,30 +738,41 @@ class TodayBangumi(_PluginBase):
                     title_origin=item.get("title_origin") or "",
                     year=item.get("year") or "",
                     subject_id=item.get("subject_id"),
+                    season=item.get("season"),
                     bangumi_total_episodes=item.get("bangumi_total_episodes"),
                     use_mp_notify=False,
                 )
                 if success:
-                    success_count += 1
-                else:
-                    fail_details.append(f"{item_title}：{message}")
-                    logger.warn(
-                        f"[TodayBangumi] 静默模式自动订阅失败：title={item_title}，原因：{message}"
-                    )
+                    return ("success", item_title)
+                return ("fail", f"{item_title}：{message}")
             except Exception as err:
-                fail_details.append(f"{item_title}：{err}")
-                logger.error(
-                    f"[TodayBangumi] 静默模式处理条目异常：title={item_title}，错误：{err}"
-                )
+                return ("error", f"{item_title}：{err}")
 
-        fail_count = len(fail_details)
+        results: List[Tuple[str, str]] = []
+        # 分批提交，每批 3 个，间隔随机延迟
+        batch_size = 3
+        for i in range(0, len(items), batch_size):
+            batch = items[i:i + batch_size]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=batch_size) as executor:
+                futures = [executor.submit(_process, item) for item in batch]
+                for future in concurrent.futures.as_completed(futures):
+                    results.append(future.result())
+            if i + batch_size < len(items):
+                time.sleep(random.uniform(2.0, 4.0))
+
+        success_count = sum(1 for r in results if r[0] == "success")
+        fail_details = [r[1] for r in results if r[0] != "success"]
+
+        for detail in fail_details:
+            logger.warn(f"[TodayBangumi] 静默模式自动订阅失败：{detail}")
+
         self.__post_summary_message(
             user_name="静默模式",
             success_count=success_count,
             fail_details=fail_details,
         )
         logger.info(
-            f"[TodayBangumi] 静默模式自动订阅完成：成功 {success_count} 条，失败 {fail_count} 条"
+            f"[TodayBangumi] 静默模式自动订阅完成：成功 {success_count} 条，失败 {len(fail_details)} 条"
         )
 
     def __should_skip_silent_refresh(self, trigger_source: str = "cron") -> bool:
@@ -747,7 +793,14 @@ class TodayBangumi(_PluginBase):
 
     def __fetch_bangumi_calendar(self, target_weekday: str, target_date: datetime.date) -> List[dict]:
         try:
-            response = RequestUtils(proxies=settings.PROXY).get_res(self._calendar_api) if self._proxy else RequestUtils().get_res(self._calendar_api)
+            sem = self._http_semaphore
+            if sem:
+                sem.acquire()
+            try:
+                response = RequestUtils(proxies=settings.PROXY).get_res(self._calendar_api) if self._proxy else RequestUtils().get_res(self._calendar_api)
+            finally:
+                if sem:
+                    sem.release()
             if not response:
                 return []
 
@@ -755,23 +808,56 @@ class TodayBangumi(_PluginBase):
             if not isinstance(data, list):
                 return []
 
-            results: List[dict] = []
+            candidates: List[Tuple[dict, datetime.date, dict]] = []
             for day_block in data:
                 weekday = day_block.get("weekday") or {}
                 weekday_en = str(weekday.get("en") or "").strip()
                 if weekday_en.lower() != target_weekday.lower():
                     continue
-
                 for subject in day_block.get("items") or []:
-                    item = self.__build_subject_item(subject=subject, target_date=target_date, weekday=weekday)
-                    if item:
-                        results.append(item)
+                    candidates.append((subject, target_date, weekday))
+
+            results: List[dict] = []
+            # 分批提交，避免同时发起过多请求
+            batch_size = 3
+            for i in range(0, len(candidates), batch_size):
+                batch = candidates[i:i + batch_size]
+                with concurrent.futures.ThreadPoolExecutor(max_workers=batch_size) as executor:
+                    futures = {
+                        executor.submit(self.__build_subject_item, s, d, w): s
+                        for s, d, w in batch
+                    }
+                    for future in concurrent.futures.as_completed(futures):
+                        item = future.result()
+                        if item:
+                            results.append(item)
+                if i + batch_size < len(candidates):
+                    time.sleep(random.uniform(1.0, 2.0))
 
             results = results[: self._items_limit]
             return results
         except Exception as err:
             logger.error(f"[TodayBangumi] 获取 Bangumi 每日放送失败：{err}")
             return []
+
+    @staticmethod
+    def __extract_season(title: str) -> int:
+        if not title:
+            return 1
+        patterns = [
+            r'[S|s](\d{1,2})\s*(?:$|\D)',
+            r'Season\s*(\d{1,2})',
+            r'第\s*(\d{1,2})\s*[季期]',
+            r'Part\s*(\d{1,2})',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, title)
+            if match:
+                try:
+                    return max(int(match.group(1)), 1)
+                except (TypeError, ValueError):
+                    return 1
+        return 1
 
     def __build_subject_item(self, subject: dict, target_date: datetime.date, weekday: dict) -> Optional[dict]:
         subject_id = subject.get("id")
@@ -807,9 +893,13 @@ class TodayBangumi(_PluginBase):
             "year": year,
             "link": link,
             "bangumi_total_episodes": bangumi_total_episodes,
+            "season": self.__extract_season(name),
         }
 
     def __request_json(self, url: str) -> Any:
+        sem = self._http_semaphore
+        if sem:
+            sem.acquire()
         try:
             response = RequestUtils(proxies=settings.PROXY).get_res(url) if self._proxy else RequestUtils().get_res(url)
             if not response:
@@ -818,6 +908,9 @@ class TodayBangumi(_PluginBase):
         except Exception as err:
             logger.warn(f"[TodayBangumi] 请求 Bangumi 接口失败：{url}，错误：{err}")
             return None
+        finally:
+            if sem:
+                sem.release()
 
     def __fetch_bangumi_total_episodes(self, subject_id: Any) -> Optional[int]:
         if not subject_id:
@@ -1069,12 +1162,27 @@ class TodayBangumi(_PluginBase):
         except Exception as err:
             logger.error(f"[TodayBangumi] 汇总通知发送失败：{err}")
 
+    @staticmethod
+    def __check_local_subscription(subject_id: Any) -> bool:
+        if subject_id is None:
+            return False
+        try:
+            sid = int(subject_id)
+        except (TypeError, ValueError):
+            return False
+        try:
+            return SubscribeOper().get_by(type="TV", bangumiid=str(sid)) is not None
+        except Exception as err:
+            logger.debug(f"[TodayBangumi] 本地订阅查询异常：{err}")
+            return False
+
     def __subscribe_item(
         self,
         title: str = "",
         title_origin: str = "",
         year: str = "",
         subject_id: Any = None,
+        season: Optional[int] = None,
         bangumi_total_episodes: Optional[int] = None,
         use_mp_notify: bool = False,
     ) -> Tuple[bool, str]:
@@ -1085,11 +1193,19 @@ class TodayBangumi(_PluginBase):
             logger.warn("[TodayBangumi] 订阅失败：标题为空")
             return False, "标题为空"
 
+        # 本地预检：仅查数据库，不发起外部请求
+        if self.__check_local_subscription(subject_id):
+            name = title or title_origin or "未知标题"
+            logger.info(f"[TodayBangumi] 本地已存在订阅，跳过外部请求：{name}")
+            return True, f"{name} 已存在订阅"
+
         search_title = title or title_origin
         meta = MetaInfo(search_title)
         if year:
             meta.year = str(year)
         meta.type = MediaType.TV
+        if season is not None:
+            meta.begin_season = season
 
         if bangumi_total_episodes is None:
             bangumi_total_episodes = self.__fetch_bangumi_total_episodes(subject_id)
@@ -1110,13 +1226,23 @@ class TodayBangumi(_PluginBase):
             logger.warn(f"[TodayBangumi] 订阅失败：未识别到媒体 {search_title} {bangumi_hint}")
             return False, f"未识别到对应媒体信息{bangumi_hint}"
 
+        # 识别后复查：通过 TMDB/Douban ID 确认是否已订阅
+        try:
+            if SubscribeChain.exists(mediainfo=mediainfo, meta=meta):
+                logger.info(f"[TodayBangumi] 媒体已订阅，跳过：{mediainfo.title_year or search_title}")
+                return True, f"{mediainfo.title_year or search_title} 已存在订阅"
+        except Exception as err:
+            logger.debug(f"[TodayBangumi] 订阅复查异常：{err}")
+
+        subscribe_season = season if season is not None else (mediainfo.season or 1)
         subscribe_kwargs = {
             "title": mediainfo.title or search_title,
             "year": mediainfo.year or year or "",
             "mtype": MediaType.TV,
             "tmdbid": mediainfo.tmdb_id,
             "doubanid": mediainfo.douban_id,
-            "season": mediainfo.season or 1,
+            "season": subscribe_season,
+            "bangumiid": int(subject_id) if subject_id is not None else None,
             "exist_ok": True,
             "username": self.plugin_name,
             "message": use_mp_notify,
@@ -1139,7 +1265,7 @@ class TodayBangumi(_PluginBase):
             f"media_category={subscribe_kwargs.get('media_category', '未注入')}"
         )
 
-        target_season = mediainfo.season or 1
+        target_season = subscribe_season
         if bangumi_total_episodes and target_season == 1:
             subscribe_kwargs.update(
                 {
@@ -1185,10 +1311,7 @@ class TodayBangumi(_PluginBase):
             logger.warn("[TodayBangumi] 批量订阅失败：当前暂无可订阅条目")
             return schemas.Response(success=False, message="暂无可订阅条目，请先刷新每日放送数据")
 
-        success_count = 0
-        fail_details: List[str] = []
-
-        for item in items:
+        def _process(item: dict) -> Tuple[str, str]:
             item_title = item.get("title") or item.get("title_origin") or "未知标题"
             try:
                 success, message = self.__subscribe_item(
@@ -1196,29 +1319,40 @@ class TodayBangumi(_PluginBase):
                     title_origin=item.get("title_origin") or "",
                     year=item.get("year") or "",
                     subject_id=item.get("subject_id"),
+                    season=item.get("season"),
                     bangumi_total_episodes=item.get("bangumi_total_episodes"),
                     use_mp_notify=False,
                 )
                 if success:
-                    success_count += 1
-                else:
-                    fail_details.append(f"{item_title}：{message}")
-                    logger.warn(
-                        f"[TodayBangumi] 批量订阅单条失败：title={item_title}，原因：{message}"
-                    )
+                    return ("success", item_title)
+                return ("fail", f"{item_title}：{message}")
             except Exception as err:
-                fail_details.append(f"{item_title}：{err}")
-                logger.error(
-                    f"[TodayBangumi] 批量订阅单条异常：title={item_title}，错误：{err}"
-                )
+                return ("error", f"{item_title}：{err}")
 
-        fail_count = len(fail_details)
+        results: List[Tuple[str, str]] = []
+        # 分批提交，每批 3 个，间隔随机延迟
+        batch_size = 3
+        for i in range(0, len(items), batch_size):
+            batch = items[i:i + batch_size]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=batch_size) as executor:
+                futures = [executor.submit(_process, item) for item in batch]
+                for future in concurrent.futures.as_completed(futures):
+                    results.append(future.result())
+            if i + batch_size < len(items):
+                time.sleep(random.uniform(2.0, 4.0))
+
+        success_count = sum(1 for r in results if r[0] == "success")
+        fail_details = [r[1] for r in results if r[0] != "success"]
+
+        for detail in fail_details:
+            logger.warn(f"[TodayBangumi] 批量订阅失败：{detail}")
+
         self.__post_summary_message(
             user_name="全部订阅",
             success_count=success_count,
             fail_details=fail_details,
         )
-        result_message = f"全部订阅完成：成功 {success_count} 条，失败 {fail_count} 条"
+        result_message = f"全部订阅完成：成功 {success_count} 条，失败 {len(fail_details)} 条"
         logger.info(f"[TodayBangumi] {result_message}")
         return schemas.Response(success=success_count > 0, message=result_message)
 
@@ -1229,9 +1363,10 @@ class TodayBangumi(_PluginBase):
         title_origin: str = "",
         year: str = "",
         subject_id: Any = None,
+        season: Optional[int] = None,
     ) -> schemas.Response:
         logger.info(
-            f"[TodayBangumi] 收到手动订阅请求：title={title}, title_origin={title_origin}, year={year}, subject_id={subject_id}"
+            f"[TodayBangumi] 收到手动订阅请求：title={title}, title_origin={title_origin}, year={year}, subject_id={subject_id}, season={season}"
         )
 
         if apikey != settings.API_TOKEN:
@@ -1243,6 +1378,7 @@ class TodayBangumi(_PluginBase):
             title_origin=title_origin,
             year=year,
             subject_id=subject_id,
+            season=season,
             use_mp_notify=True,
         )
         return schemas.Response(success=success, message=message)
