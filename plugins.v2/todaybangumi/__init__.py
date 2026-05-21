@@ -537,41 +537,15 @@ class TodayBangumi(_PluginBase):
                                             "component": "div",
                                             "content": [
                                                 {
-                                                    "component": "VRow",
-                                                    "props": {"dense": True, "class": "mx-0"},
-                                                    "content": [
-                                                        {
-                                                            "component": "VCol",
-                                                            "props": {"cols": 4},
-                                                            "content": [
-                                                                {
-                                                                    "component": "VTextField",
-                                                                    "props": {
-                                                                        "model": f"season_{subject_id}",
-                                                                        "label": "季",
-                                                                        "type": "number",
-                                                                        "min": 1,
-                                                                        "max": 99,
-                                                                        "hide-details": True,
-                                                                        "density": "compact",
-                                                                        "variant": "outlined",
-                                                                        "value": detected_season,
-                                                                    },
-                                                                }
-                                                            ],
-                                                        },
-                                                    ],
-                                                },
-                                                {
                                                     "component": "VCardActions",
-                                                    "props": {"class": "pa-0 d-flex ga-2"},
+                                                    "props": {"class": "pa-0 d-flex ga-1"},
                                                     "content": [
                                                         {
                                                             "component": "VBtn",
                                                             "props": {
                                                                 "color": "primary",
                                                                 "variant": "tonal",
-                                                                "size": "small",
+                                                                "size": "x-small",
                                                             },
                                                             "text": "添加订阅",
                                                             "events": {
@@ -594,7 +568,7 @@ class TodayBangumi(_PluginBase):
                                                             "props": {
                                                                 "color": "grey",
                                                                 "variant": "outlined",
-                                                                "size": "small",
+                                                                "size": "x-small",
                                                                 "href": link,
                                                                 "target": "_blank",
                                                             },
