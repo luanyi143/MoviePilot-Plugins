@@ -18,7 +18,7 @@ from app.core.metainfo import MetaInfo
 from app.helper.mediaserver import MediaServerHelper
 from app.log import logger
 from app.plugins import _PluginBase
-from app.schemas import MediaType
+from app.schemas import MediaType, NotificationType
 from app.utils.dom import DomUtils
 from app.utils.http import RequestUtils
 
@@ -1272,6 +1272,7 @@ class DoubanComingNotice(_PluginBase):
                 title="**📺 豆瓣开播提醒 ✨**",
                 text=text,
                 image=poster,
+                mtype=NotificationType.Subscribe,
             )
         except Exception as err:
             logger.error(f"发送开播提醒失败：{err}")
